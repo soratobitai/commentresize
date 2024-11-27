@@ -307,9 +307,11 @@ function ChangeCommentsStyle(tableRow) {
     }
 
     // 弾幕コメント判定
-    const comment = commentText.textContent
-    if (comment) {
-        commentText.style.whiteSpace = isDanmakuComment(comment) ? 'nowrap' : 'normal'
+    if (isShowFullComment) {
+        const comment = commentText.textContent
+        if (comment) {
+            commentText.style.whiteSpace = isDanmakuComment(comment) ? 'nowrap' : 'normal'
+        }
     }
     
     // コメント全文表示時、背景色をストライプにする
