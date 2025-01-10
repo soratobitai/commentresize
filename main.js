@@ -37,30 +37,8 @@ window.addEventListener('load', function () {
         // ホイールイベントを追加
         attachWheelEventForAutoScroll()
 
-
-        // 開発用
-        // setInterval(() => {
-        //     const table = targetNode.querySelector('[class*="_table_"]')
-
-        //     // 子要素の最後の要素を取得
-        //     const lastChildElement = table.lastElementChild
-
-        //     if (table && lastChildElement) {
-        //         // 親要素の底辺の位置を取得
-        //         const parentBottom = table.getBoundingClientRect().bottom
-
-        //         // 最後の子要素の底辺の位置を取得
-        //         const lastChildBottom = lastChildElement.getBoundingClientRect().bottom
-
-        //         // 結果をコンソールに出力
-        //         console.log('位置:', parentBottom, lastChildBottom)
-        //     } else {
-        //         // console.error('親要素または最後の子要素が見つかりませんでした')
-        //     }
-
-        // }, 5000)
-
-        // testButton()
+        // インジケータボタンのイベントを追加
+        addClickEvent_indicatorButton()
 
     }, 1500) // 1500
 })
@@ -256,18 +234,19 @@ function updateStyles(targets) {
         // コメントタブに切り替わった時に再度イベントを追加
         if (target.classList.contains('contents-tab-panel')) {
             attachWheelEventForAutoScroll()
-            updateStyles(target.querySelectorAll('.table-row'))
-            return
-        }
-
-        // 「最新コメントに戻るボタン」が表示されたらイベントを追加（レイアウト崩れ修正用）
-        if (target.classList.contains('indicator')) {
             addClickEvent_indicatorButton()
+            updateStyles(target.querySelectorAll('.table-row'))
             return
         }
 
         // コメントの要素でない場合はスキップ
         if (!target.classList.contains('table-row')) return
+
+        // あるクラス名を含んでいる場合はスキップ
+        if (target.classList.contains('fix-element')) return
+
+        // fix-elementを削除
+        target.parentElement?.querySelector('.fix-element')?.remove()
 
         // 要素を取得
         const tableRow = target
@@ -304,23 +283,23 @@ function ChangeCommentsStyle(tableRow) {
     if (commentText) {
         commentText.style.fontSize = commentTextFontSize
         commentText.style.whiteSpace = isShowFullComment ? 'normal' : 'nowrap'
-    }
 
-    // 弾幕コメント判定
-    if (isShowFullComment) {
-        const comment = commentText.textContent
-        if (comment) {
-            commentText.style.whiteSpace = isDanmakuComment(comment) ? 'nowrap' : 'normal'
+        // 弾幕コメント判定
+        if (isShowFullComment) {
+            const comment = commentText.textContent
+            if (comment) {
+                commentText.style.whiteSpace = isDanmakuComment(comment) ? 'nowrap' : 'normal'
+            }
         }
     }
     
     // コメント全文表示時、背景色をストライプにする
     const tableRows = tableRow.parentElement.querySelectorAll('.table-row')
-    if (!tableRows) return
-    Array.from(tableRows).forEach((tableRow, index) => {
-        tableRow.style.backgroundColor = (index % 2 === 0) === isBackgroundColor
-            ? (isShowFullComment ? 'rgba(150, 150, 150, 0.2)' : '')
-            : ''
+    tableRows.forEach((row, index) => {
+        const isEven = index % 2 === 0
+        const shouldApplyBackground = isEven === isBackgroundColor
+        const backgroundColor = isShowFullComment ? 'rgba(150, 150, 150, 0.2)' : ''
+        row.style.backgroundColor = shouldApplyBackground ? backgroundColor : ''
     })
 }
 
@@ -332,7 +311,7 @@ function autoScroll(tableBody, tableRow) {
     // 一番下へスクロール
     setTimeout(() => {
         if (!isWheelActive) scrollToPosition(tableBody)
-    }, 100)
+    }, 500)
 }
 
 // スクロール
@@ -362,13 +341,30 @@ function isScrollAtBottom() {
 
 function addClickEvent_indicatorButton() {
     const playerSection = document.querySelector('[class*="_player-section_"]')
-    const indicator = playerSection?.querySelector('[class*="_indicator_"]')
-    if (!indicator) return
+    if (!playerSection) return
 
-    indicator.addEventListener('click', function () {
+    // MutationObserverで`indicator`の追加を監視
+    const observer = new MutationObserver(() => {
+        const indicator = playerSection.querySelector('[class*="_indicator_"]')
+        if (indicator && !indicator.dataset.myEventAdded) {
+            // イベントが未登録の場合のみ追加
+            indicator.addEventListener('click', handleIndicatorClick)
+            indicator.dataset.myEventAdded = 'true' // フラグを設定して再登録を防止
+        }
+    })
+
+    // `playerSection` 内のDOM変更を監視
+    observer.observe(playerSection, {
+        childList: true,
+        subtree: true,
+    })
+
+    // イベントハンドラー関数
+    function handleIndicatorClick(e) {
         const emotionButton = document.querySelector('[class*="_emotion-button_"]')
         const lockItemArea = document.querySelector('[class*="_lock-item-area_"]')
         const nageadButton = lockItemArea?.querySelector('[data-content-type="nagead"]')
+
         if (emotionButton) {
             emotionButton.click()
             setTimeout(() => emotionButton.click(), 100)
@@ -376,16 +372,19 @@ function addClickEvent_indicatorButton() {
             nageadButton.click()
             setTimeout(() => nageadButton.click(), 100)
         }
-    })
+    }
 }
 
-// 通常のコメントを抽出する正規表現
-const regex = /[ぁ-ゟ゠-ヿ一-龯ａ-ｚＡ-Ｚa-zA-Z0-9０-９]/g
+
+
 
 // 弾幕判定関数
 function isDanmakuComment(comment) {
     const totalLength = comment.length
     if (totalLength === 0) return false
+
+    // 通常のコメントを抽出する正規表現
+    const regex = /[ぁ-ゟ゠-ヿ一-龯ａ-ｚＡ-Ｚa-zA-Z0-9０-９]/g
 
     // 弾幕文字の割合を計算
     const danmakuCount = (comment.replace(regex, '') || []).length
@@ -414,35 +413,36 @@ function isDanmakuComment(comment) {
 // }
 
 
-function testButton() {
-    // ボタンを作成
-    const button = document.createElement('button')
-    button.textContent = 'TEST!'
-    button.style.position = 'fixed'
-    button.style.bottom = '20px'
-    button.style.right = '20px'
-    button.style.padding = '10px 20px'
-    button.style.backgroundColor = '#007bff'
-    button.style.color = '#fff'
-    button.style.border = 'none'
-    button.style.borderRadius = '5px'
-    button.style.cursor = 'pointer'
-    button.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.1)'
-    button.style.zIndex = '9999'
+// function testButton() {
+//     // ボタンを作成
+//     const button = document.createElement('button')
+//     button.textContent = 'TEST!'
+//     button.style.position = 'fixed'
+//     button.style.bottom = '20px'
+//     button.style.right = '20px'
+//     button.style.padding = '10px 20px'
+//     button.style.backgroundColor = '#007bff'
+//     button.style.color = '#fff'
+//     button.style.border = 'none'
+//     button.style.borderRadius = '5px'
+//     button.style.cursor = 'pointer'
+//     button.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.1)'
+//     button.style.zIndex = '9999'
 
-    // ボタンにホバー効果を追加
-    button.addEventListener('mouseover', () => {
-        button.style.backgroundColor = '#0056b3'
-    })
-    button.addEventListener('mouseout', () => {
-        button.style.backgroundColor = '#007bff'
-    })
+//     // ボタンにホバー効果を追加
+//     button.addEventListener('mouseover', () => {
+//         button.style.backgroundColor = '#0056b3'
+//     })
+//     button.addEventListener('mouseout', () => {
+//         button.style.backgroundColor = '#007bff'
+//     })
 
-    // ボタンクリック時の動作を定義
-    button.addEventListener('click', () => {
-        // fix()
-    })
+//     // ボタンクリック時の動作を定義
+//     button.addEventListener('click', () => {
+//         // fix()
+//     })
 
-    // ボタンをドキュメントに追加
-    document.body.appendChild(button)
-}
+//     // ボタンをドキュメントに追加
+//     document.body.appendChild(button)
+// }
+
