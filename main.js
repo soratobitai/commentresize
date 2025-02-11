@@ -15,7 +15,6 @@ chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShow
 })
 
 let isWheelActive = false // スクロール中かどうかのフラグ
-let isBackgroundColor = false // 背景色を変更するかどうかのフラグ
 
 window.addEventListener('load', function () {
 
@@ -255,9 +254,10 @@ function updateStyles(targets) {
         const tableBody = table?.parentElement
         if (!tableBody) return
 
-        // コメントのスタイルを変更
-        ChangeCommentsStyle(tableRow)
-        isBackgroundColor = !isBackgroundColor
+        // コメントのスタイルを変更（スクロール不具合対策で遅延実行）
+        setTimeout(() => {
+            ChangeCommentsStyle(tableRow)
+        }, 10)
 
         // 自動スクロール
         autoScroll(tableBody, tableRow)
@@ -292,15 +292,21 @@ function ChangeCommentsStyle(tableRow) {
             }
         }
     }
-    
-    // コメント全文表示時、背景色をストライプにする
-    const tableRows = tableRow.parentElement.querySelectorAll('.table-row')
-    tableRows.forEach((row, index) => {
-        const isEven = index % 2 === 0
-        const shouldApplyBackground = isEven === isBackgroundColor
-        const backgroundColor = isShowFullComment ? 'rgba(150, 150, 150, 0.2)' : ''
-        row.style.backgroundColor = shouldApplyBackground ? backgroundColor : ''
-    })
+
+    const previousElement = tableRow.previousElementSibling
+    const nextElement = tableRow.nextElementSibling
+
+    if (previousElement) { // 前の要素が存在するかチェック
+        if (!previousElement.classList.contains('gray-background')) {
+            tableRow.classList.add('gray-background')
+        }
+    } else {
+        if (nextElement) { // 後の要素が存在するかチェック
+            if (!nextElement.classList.contains('gray-background')) {
+                tableRow.classList.add('gray-background')
+            }
+        }
+    }
 }
 
 function autoScroll(tableBody, tableRow) {
