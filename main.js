@@ -39,7 +39,7 @@ window.addEventListener('load', function () {
         // インジケータボタンのイベントを追加
         addClickEvent_indicatorButton()
 
-    }, 1500) // 1500
+    }, 1500) // 1500 ミリ秒後に実行 (負荷軽減のため)
 })
 
 function attachWheelEventForAutoScroll() {
@@ -87,7 +87,7 @@ function insertSettingPanel(targetNode) {
             <div style="margin-top: 10px;">
                 <label>
                     <input type="checkbox" id="isShowFullCommentCheckbox" ${isShowFullComment ? 'checked' : ''}>
-                    コメント折り返し（β）
+                    長いコメントを折り返す
                 </label>
             </div>
         </div>
@@ -181,7 +181,7 @@ function insertToggleButton() {
     if (addonController) {
         const toggleButton = document.createElement('button')
         toggleButton.textContent = 'Aa'
-        toggleButton.style.backgroundColor = '#000'
+        toggleButton.style.backgroundColor = 'initial'
         toggleButton.style.color = '#fff'
         toggleButton.style.border = 'none'
         toggleButton.style.cursor = 'pointer'
@@ -257,7 +257,7 @@ function updateStyles(targets) {
         // コメントのスタイルを変更（スクロール不具合対策で遅延実行）
         setTimeout(() => {
             ChangeCommentsStyle(tableRow)
-        }, 10)
+        }, isWheelActive ? 10 : 0)
 
         // 自動スクロール
         autoScroll(tableBody, tableRow)
@@ -271,6 +271,10 @@ function ChangeCommentsStyle(tableRow) {
     
     tableRow.style.height = 'auto'
     tableRow.style.minHeight = '32px'
+
+    tableRow.style.paddingTop = isShowFullComment ? '0.4rem' : '0'
+    tableRow.style.paddingBottom = isShowFullComment ? '0.4rem' : '0'
+    tableRow.style.borderBottom = isShowFullComment ? '1px solid rgba(150, 150, 150, 0.4)' : 'none'
 
     // コメント番号のサイズを変更
     const commentNumber = tableRow.querySelector('.comment-number')
@@ -293,20 +297,21 @@ function ChangeCommentsStyle(tableRow) {
         }
     }
 
-    const previousElement = tableRow.previousElementSibling
-    const nextElement = tableRow.nextElementSibling
+    // 背景色をストライプに
+    // const previousElement = tableRow.previousElementSibling
+    // const nextElement = tableRow.nextElementSibling
 
-    if (previousElement) { // 前の要素が存在するかチェック
-        if (!previousElement.classList.contains('gray-background')) {
-            tableRow.classList.add('gray-background')
-        }
-    } else {
-        if (nextElement) { // 後の要素が存在するかチェック
-            if (!nextElement.classList.contains('gray-background')) {
-                tableRow.classList.add('gray-background')
-            }
-        }
-    }
+    // if (previousElement) { // 前の要素が存在するかチェック
+    //     if (!previousElement.classList.contains('gray-background')) {
+    //         tableRow.classList.add('gray-background')
+    //     }
+    // } else {
+    //     if (nextElement) { // 後の要素が存在するかチェック
+    //         if (!nextElement.classList.contains('gray-background')) {
+    //             tableRow.classList.add('gray-background')
+    //         }
+    //     }
+    // }
 }
 
 function autoScroll(tableBody, tableRow) {
@@ -317,7 +322,7 @@ function autoScroll(tableBody, tableRow) {
     // 一番下へスクロール
     setTimeout(() => {
         if (!isWheelActive) scrollToPosition(tableBody)
-    }, 500)
+    }, 100)
 }
 
 // スクロール
