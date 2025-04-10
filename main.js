@@ -16,7 +16,7 @@ chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShow
 
 let isWheelActive = false // スクロール中かどうかのフラグ
 
-window.addEventListener('load', function () {
+document.addEventListener('DOMContentLoaded', () => {
 
     // 監視対象の要素
     const targetNode = document.body
@@ -170,6 +170,7 @@ function insertSettingPanel(targetNode) {
     })
 
     insertToggleButton() // トグルボタンをaddon-controller内に挿入
+    watchFullscreenChange() // フルスクリーン時にボタン非表示
 }
 
 
@@ -179,15 +180,16 @@ function insertSettingPanel(targetNode) {
 function insertToggleButton() {
     const addonController = document.querySelector('.addon-controller')
     if (addonController) {
-        const toggleButton = document.createElement('button')
-        toggleButton.textContent = 'Aa'
-        toggleButton.style.backgroundColor = 'initial'
-        toggleButton.style.color = '#fff'
-        toggleButton.style.border = 'none'
-        toggleButton.style.cursor = 'pointer'
+        const optionButton = document.createElement('button')
+        optionButton.textContent = 'Aa'
+        optionButton.style.backgroundColor = 'initial'
+        optionButton.style.color = '#fff'
+        optionButton.style.border = 'none'
+        optionButton.style.cursor = 'pointer'
+        optionButton.classList.add('option-button')
 
         // 設定画面表示・非表示のトグル
-        toggleButton.addEventListener('click', function () {
+        optionButton.addEventListener('click', function () {
             const sliderContainer = document.querySelector('.setting-container')
             if (sliderContainer) {
                 sliderContainer.style.display = sliderContainer.style.display === 'none' ? 'block' : 'none'
@@ -195,7 +197,7 @@ function insertToggleButton() {
         })
 
         // addon-controller内の最後にボタンを挿入
-        addonController.appendChild(toggleButton)
+        addonController.appendChild(optionButton)
     }
 }
 
@@ -241,11 +243,11 @@ function updateStyles(targets) {
         // コメントの要素でない場合はスキップ
         if (!target.classList.contains('table-row')) return
 
-        // あるクラス名を含んでいる場合はスキップ
-        if (target.classList.contains('fix-element')) return
+        // // あるクラス名を含んでいる場合はスキップ
+        // if (target.classList.contains('fix-element')) return
 
-        // fix-elementを削除
-        target.parentElement?.querySelector('.fix-element')?.remove()
+        // // fix-elementを削除
+        // target.parentElement?.querySelector('.fix-element')?.remove()
 
         // 要素を取得
         const tableRow = target
@@ -256,8 +258,8 @@ function updateStyles(targets) {
 
         // コメントのスタイルを変更（スクロール不具合対策で遅延実行）
         setTimeout(() => {
-            ChangeCommentsStyle(tableRow)
-        }, isWheelActive ? 10 : 0)
+            changeCommentsStyle(tableRow)
+        }, isWheelActive ? 1 : 0)
 
         // 自動スクロール
         autoScroll(tableBody, tableRow)
@@ -267,7 +269,7 @@ function updateStyles(targets) {
 /**
  * コメントのスタイルを変更
  */
-function ChangeCommentsStyle(tableRow) {
+function changeCommentsStyle(tableRow) {
     
     tableRow.style.height = 'auto'
     tableRow.style.minHeight = '32px'
@@ -296,22 +298,6 @@ function ChangeCommentsStyle(tableRow) {
             }
         }
     }
-
-    // 背景色をストライプに
-    // const previousElement = tableRow.previousElementSibling
-    // const nextElement = tableRow.nextElementSibling
-
-    // if (previousElement) { // 前の要素が存在するかチェック
-    //     if (!previousElement.classList.contains('gray-background')) {
-    //         tableRow.classList.add('gray-background')
-    //     }
-    // } else {
-    //     if (nextElement) { // 後の要素が存在するかチェック
-    //         if (!nextElement.classList.contains('gray-background')) {
-    //             tableRow.classList.add('gray-background')
-    //         }
-    //     }
-    // }
 }
 
 function autoScroll(tableBody, tableRow) {
@@ -386,9 +372,6 @@ function addClickEvent_indicatorButton() {
     }
 }
 
-
-
-
 // 弾幕判定関数
 function isDanmakuComment(comment) {
     const totalLength = comment.length
@@ -406,6 +389,30 @@ function isDanmakuComment(comment) {
 
     return isNormalTextHeavy
 }
+
+// フルスクリーン時にボタン非表示
+function watchFullscreenChange() {
+    const optionButton = document.getElementsByClassName('option-button')[0]
+
+    if (!optionButton) return
+
+    const observer = new ResizeObserver(entries => {
+        for (const entry of entries) {
+            const elementWidth = entry.contentRect.width
+            const windowWidth = window.innerWidth
+
+            if (elementWidth === windowWidth) {
+                optionButton.style.display = 'none'
+            } else {
+                optionButton.style.display = ''
+            }
+        }
+    })
+
+    const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
+    elements.forEach(el => observer.observe(el))
+}
+
 
 // // 矢印（下へ）ボタンがあるかどうか
 // function isIndicatorButton() {
