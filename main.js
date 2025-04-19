@@ -6,14 +6,6 @@ const defaultIsShowFullComment = false
 let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
-
-// 初期値を chrome.storage から取得
-chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment'], (result) => {
-    commentNumberFontSize = result.commentNumberFontSize || defaultCommentNumberFontSize
-    commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
-    isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
-})
-
 let isWheelActive = false // スクロール中かどうかのフラグ
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -22,24 +14,32 @@ document.addEventListener('DOMContentLoaded', () => {
     const targetNode = document.getElementById('root')
     if (!targetNode) return
 
-    setTimeout(() => {
+    // chrome.storageから設定を取得
+    chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment'], (result) => {
+        commentNumberFontSize = result.commentNumberFontSize || defaultCommentNumberFontSize
+        commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
+        isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
 
-        // 設定画面を追加
-        insertSettingPanel(targetNode)
+        // ここで初期化スタート（設定取得後！）
+        setTimeout(() => {
 
-        // コメントの挿入を監視
-        checkElementInsert(targetNode)
+            // 設定画面を追加
+            insertSettingPanel(targetNode)
 
-        // 初期スタイルを適用
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+            // コメントの挿入を監視
+            checkElementInsert(targetNode)
 
-        // ホイールイベントを追加
-        attachWheelEventForAutoScroll()
+            // 初期スタイルを適用
+            updateStyles(targetNode.querySelectorAll('.table-row'))
 
-        // インジケータボタンのイベントを追加
-        addClickEvent_indicatorButton()
+            // ホイールイベントを追加
+            attachWheelEventForAutoScroll()
 
-    }, 3000) // 負荷軽減のため
+            // インジケータボタンのイベントを追加
+            addClickEvent_indicatorButton()
+
+        }, 3000) // 負荷軽減のため
+    })
 })
 
 function attachWheelEventForAutoScroll() {
@@ -230,98 +230,107 @@ function checkElementInsert(targetNode) {
  * スタイルを適用
  */
 function updateStyles(targets) {
-    targets.forEach(target => {
+    const tableRows = []
 
-        // コメントタブに切り替わった時に再度イベントを追加
+    targets.forEach(target => {
         if (target.classList.contains('contents-tab-panel')) {
             attachWheelEventForAutoScroll()
             addClickEvent_indicatorButton()
-            updateStyles(target.querySelectorAll('.table-row'))
+            updateStyles(Array.from(target.querySelectorAll('.table-row')))
             return
         }
 
-        // コメントの要素でない場合はスキップ
-        if (!target.classList.contains('table-row')) return
+        if (target.classList.contains('table-row')) {
+            tableRows.push(target)
+        }
+    })
 
-        // 要素を取得
-        const tableRow = target
-        const table = tableRow.parentElement
-        if (!table) return
-        const tableBody = table?.parentElement
+    if (tableRows.length > 0) {
+        const tableBody = tableRows[0]?.parentElement?.parentElement
         if (!tableBody) return
 
-        // コメントのスタイルを変更（スクロール不具合対策で遅延実行）
         setTimeout(() => {
+            changeCommentsStyles(tableRows)
 
-            // コメントのスタイルを変更
-            changeCommentsStyle(tableRow)
-
-            // 自動スクロール
-            setTimeout(() => autoScroll(tableBody, tableRow), 100)
-
+            setTimeout(() => {
+                const lastRow = tableRows[tableRows.length - 1]
+                if (lastRow && !isWheelActive) {
+                    scrollToPosition(tableBody, lastRow.offsetTop - tableBody.offsetTop)
+                }
+            }, 100)
         }, isWheelActive ? 10 : 0)
-    })
+    }
 }
 
 /**
  * コメントのスタイルを変更
  */
-function changeCommentsStyle(tableRow) {
-    
-    tableRow.style.height = 'auto'
-    tableRow.style.minHeight = '32px'
+function changeCommentsStyles(tableRows) {
+    if (!Array.isArray(tableRows) || tableRows.length === 0) return
 
-    tableRow.style.paddingTop = isShowFullComment ? '0.4rem' : '0'
-    tableRow.style.paddingBottom = isShowFullComment ? '0.4rem' : '0'
-    tableRow.style.borderBottom = isShowFullComment ? '1px solid rgba(150, 150, 150, 0.4)' : 'none'
+    const excludedTypes = [
+        'commentLock',
+        'userFollow',
+    ]
 
-    // 通常コメント以外はスキップ // commentLock
-    if (tableRow.getAttribute('data-comment-type') !== 'normal') return
+    requestAnimationFrame(() => {
 
-    // コメント番号のサイズを変更
-    const commentNumber = tableRow.querySelector('.comment-number')
-    if (commentNumber) {
-        commentNumber.style.fontSize = commentNumberFontSize
-    }
+        for (const row of tableRows) {
+            if (!row) continue
 
-    // コメントテキストのサイズを変更
-    const commentText = tableRow.querySelector('.comment-text')
-    if (commentText) {
-        commentText.style.fontSize = commentTextFontSize
-        commentText.style.whiteSpace = isShowFullComment ? 'normal' : 'nowrap'
+            // 基本スタイル
+            row.style.cssText += `
+                height: auto;
+                min-height: 32px;
+                padding-top: 0.4rem;
+                padding-bottom: 0.4rem;
+                border-bottom: 1px solid rgba(150,150,150,0.4);
+            `
 
-        // 弾幕コメント判定
-        if (isShowFullComment) {
-            const comment = commentText.textContent
-            if (comment) {
-                commentText.style.whiteSpace = isDanmakuComment(comment) ? 'nowrap' : 'normal'
+            const commentNumber = row.querySelector('.comment-number')
+            const commentText = row.querySelector('.comment-text')
+            const commentType = row.getAttribute('data-comment-type') || ''
+
+            // 除外するコメントタイプ
+            if (excludedTypes.includes(commentType)) continue
+
+            // コメント番号のサイズを変更
+            if (commentNumber) {
+                commentNumber.style.fontSize = commentNumberFontSize
+            }
+
+            // コメントテキストのサイズを変更
+            if (commentText) {
+                commentText.style.fontSize = commentTextFontSize
+
+                const comment = commentText.textContent || ''
+                const isDanmaku = isDanmakuComment(comment)
+                const whiteSpace = isShowFullComment && !isDanmaku ? 'normal' : 'nowrap'
+
+                commentText.style.whiteSpace = whiteSpace
             }
         }
-    }
+    })
 }
 
 function autoScroll(tableBody, tableRow) {
-
     // コメントサイズ分スクロール
     if (!isWheelActive) scrollToPosition(tableBody, tableRow.offsetHeight)
-    
-    // 一番下へスクロール
-    // setTimeout(() => {
-    //     if (!isWheelActive) scrollToPosition(tableBody)
-    // }, 100)
 }
 
 // スクロール
-function scrollToPosition(tableBody, position = 'bottom') {    
-    if (position === 'bottom') {
-        tableBody.scrollTo({
-            top: tableBody.scrollHeight
-        })
-    } else if (typeof position === 'number') {
-        tableBody.scrollBy({
-            top: position
-        })
-    }
+function scrollToPosition(tableBody, position = 'bottom') {
+    if (!tableBody) return
+
+    const isBottom = position === 'bottom'
+    const isNumber = typeof position === 'number'
+
+    tableBody.scrollTo({
+        top: isBottom
+            ? tableBody.scrollHeight
+            : tableBody.scrollTop + (isNumber ? position : 0),
+        behavior: 'auto'
+    })
 }
 
 // スクロール位置が一番下にあるか
