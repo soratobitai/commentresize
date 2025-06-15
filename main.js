@@ -6,7 +6,17 @@ const defaultIsShowFullComment = false
 let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
-let isWheelActive = false // スクロール中かどうかのフラグ
+let isWheelActive = false // スクロール中かどうかのフラグ
+let isButtonInserted = false // ボタン挿入フラグ
+let saveTimeout = null // 保存の遅延用タイマー
+let updateStylesTimeout = null // スタイル更新の遅延用タイマー
+
+// リソース管理用のグローバル変数
+let wheelEventTimeout = null // ホイールイベント用タイマー
+let commentInsertObserver = null // コメント挿入監視用Observer
+let indicatorButtonObserver = null // インジケータボタン監視用Observer
+let fullscreenObserver = null // フルスクリーン監視用Observer
+let isWheelEventAttached = false // ホイールイベント重複防止フラグ
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -16,53 +26,154 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // chrome.storageから設定を取得
     chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment'], (result) => {
+        // エラーハンドリング
+        if (chrome.runtime.lastError) {
+            // console.warn('設定の読み出しに失敗しました:', chrome.runtime.lastError)
+            // デフォルト値を使用
+        }
+
         commentNumberFontSize = result.commentNumberFontSize || defaultCommentNumberFontSize
         commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
 
-        // ここで初期化スタート（設定取得後！）
-        setTimeout(() => {
-
-            // 設定画面を追加
-            insertSettingPanel(targetNode)
-
-            // コメントの挿入を監視
-            checkElementInsert(targetNode)
-
-            // 初期スタイルを適用
-            updateStyles(targetNode.querySelectorAll('.table-row'))
-
-            // ホイールイベントを追加
-            attachWheelEventForAutoScroll()
-
-            // インジケータボタンのイベントを追加
-            addClickEvent_indicatorButton()
-
-        }, 3000) // 負荷軽減のため
+        // 初期化を即座に開始
+        initializeApp(targetNode)
     })
 })
 
+/**
+ * アプリケーションの初期化
+ */
+function initializeApp(targetNode) {
+    // CSSスタイルルールを作成
+    createCommentStyles()
+
+    // 設定画面を追加
+    insertSettingPanel(targetNode)
+
+    // コメントの挿入を監視
+    checkElementInsert(targetNode)
+
+    // 初期スタイルを適用
+    updateCommentStyles(true) // 即座に更新
+
+    // ホイールイベントを追加
+    attachWheelEventForAutoScroll()
+
+    // インジケータボタンのイベントを追加（一度だけ）
+    if (!isButtonInserted) {
+        addClickEvent_indicatorButton()
+        isButtonInserted = true
+    }
+
+    // 設定ボタンを追加（少し遅延させてDOMの準備を待つ）
+    setTimeout(() => {
+        insertToggleButton()
+    }, 1000)
+}
+
+/**
+ * 設定を保存（デバウンス機能付き）
+ */
+function saveSettings(settings, immediate = false) {
+    if (saveTimeout) {
+        clearTimeout(saveTimeout)
+    }
+
+    if (immediate) {
+        // 即座に保存（チェックボックスなど）
+        chrome.storage.sync.set(settings, () => {
+            if (chrome.runtime.lastError) {
+                // console.warn('設定の保存に失敗しました:', chrome.runtime.lastError)
+            }
+        })
+    } else {
+        // 遅延保存（スライダーなど）
+        saveTimeout = setTimeout(() => {
+            chrome.storage.sync.set(settings, () => {
+                if (chrome.runtime.lastError) {
+                    // console.warn('設定の保存に失敗しました:', chrome.runtime.lastError)
+                }
+            })
+        }, 500) // 500ms遅延
+    }
+}
+
+/**
+ * リソースのクリーンアップ
+ */
+function cleanupResources() {
+    // タイマーのクリーンアップ
+    if (saveTimeout) {
+        clearTimeout(saveTimeout)
+        saveTimeout = null
+    }
+    if (updateStylesTimeout) {
+        clearTimeout(updateStylesTimeout)
+        updateStylesTimeout = null
+    }
+    if (wheelEventTimeout) {
+        clearTimeout(wheelEventTimeout)
+        wheelEventTimeout = null
+    }
+
+    // Observerのクリーンアップ
+    if (commentInsertObserver) {
+        commentInsertObserver.disconnect()
+        commentInsertObserver = null
+    }
+    if (indicatorButtonObserver) {
+        indicatorButtonObserver.disconnect()
+        indicatorButtonObserver = null
+    }
+    if (fullscreenObserver) {
+        fullscreenObserver.disconnect()
+        fullscreenObserver = null
+    }
+
+    // フラグのリセット
+    isWheelEventAttached = false
+}
+
 function attachWheelEventForAutoScroll() {
-    let timeout // タイマー用の変数
+    try {
+        // 既にイベントが追加されている場合はスキップ
+        if (isWheelEventAttached) return
 
-    // マウスホイール操作を検出
-    const tableBody = document.querySelector('[class*="_body_"]')
-    if (!tableBody) return
-    tableBody.addEventListener('wheel', () => {
-        isWheelActive = true // ホイール操作中はtrueに設定
-
-        // 既存のタイマーをクリアして再設定
-        clearTimeout(timeout)
-
-        if (isScrollAtBottom()) {
-            isWheelActive = false
+        // マウスホイール操作を検出
+        const tableBody = document.querySelector('[class*="_body_"]')
+        if (!tableBody) {
+            // console.warn('ホイールイベント対象の要素が見つかりません')
+            return
         }
 
-        // 一定時間後にフラグをfalseに戻す
-        timeout = setTimeout(() => {
-            isWheelActive = false
-        }, 1000)
-    })
+        tableBody.addEventListener('wheel', () => {
+            try {
+                isWheelActive = true // ホイール操作中はtrueに設定
+
+                // 既存のタイマーをクリアして再設定
+                if (wheelEventTimeout) {
+                    clearTimeout(wheelEventTimeout)
+                }
+
+                if (isScrollAtBottom()) {
+                    isWheelActive = false
+                }
+
+                // 一定時間後にフラグをfalseに戻す
+                wheelEventTimeout = setTimeout(() => {
+                    isWheelActive = false
+                }, 1000)
+            } catch (error) {
+                // console.warn('ホイールイベント処理中にエラーが発生しました:', error)
+                isWheelActive = false
+            }
+        })
+
+        isWheelEventAttached = true
+    } catch (error) {
+        // console.warn('ホイールイベントの設定中にエラーが発生しました:', error)
+    }
 }
 
 /**
@@ -79,10 +190,10 @@ function insertSettingPanel(targetNode) {
     sliderContainer.innerHTML = `
         <div style="padding:20px; border-top: 1px solid #ccc;">
             <label>番号サイズ: <span id="comment-number-size">${commentNumberFontSize}</span></label>
-            <input id="commentNumberSlider" type="range" min="50" max="300" value="${parseInt(commentNumberFontSize)}" style="width: 100%;">
+            <input id="commentNumberSlider" type="range" min="50" max="300" value="${parseInt(commentNumberFontSize) || 100}" style="width: 100%;">
             <br>
             <label>コメントサイズ: <span id="comment-text-size">${commentTextFontSize}</span></label>
-            <input id="commentTextSlider" type="range" min="50" max="300" value="${parseInt(commentTextFontSize)}" style="width: 100%;">
+            <input id="commentTextSlider" type="range" min="50" max="300" value="${parseInt(commentTextFontSize) || 100}" style="width: 100%;">
             <br>
             <div style="margin-top: 10px;">
                 <label>
@@ -104,40 +215,40 @@ function insertSettingPanel(targetNode) {
     // チェックボックスの変更イベント
     isShowFullCommentCheckbox.addEventListener('change', function () {
         isShowFullComment = this.checked
-        chrome.storage.sync.set({ isShowFullComment }) // chrome.storageに保存
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+        saveSettings({ isShowFullComment }, true) // 即座に保存
+        updateCommentStyles(true) // 即座に更新
     })
 
     // スライダーのイベントリスナー
     commentNumberSlider.addEventListener('input', function () {
         commentNumberFontSize = this.value + '%'
         commentNumberSizeLabel.textContent = commentNumberFontSize
-        chrome.storage.sync.set({ commentNumberFontSize }) // chrome.storageに保存
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+        saveSettings({ commentNumberFontSize }) // 遅延保存
+        updateCommentStyles() // 遅延更新
     })
 
     commentTextSlider.addEventListener('input', function () {
         commentTextFontSize = this.value + '%'
         commentTextSizeLabel.textContent = commentTextFontSize
-        chrome.storage.sync.set({ commentTextFontSize }) // chrome.storageに保存
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+        saveSettings({ commentTextFontSize }) // 遅延保存
+        updateCommentStyles() // 遅延更新
     })
 
     // ダブルクリックでデフォルトサイズにリセット
     commentNumberSlider.addEventListener('dblclick', function () {
         commentNumberFontSize = defaultCommentNumberFontSize
         commentNumberSizeLabel.textContent = commentNumberFontSize
-        commentNumberSlider.value = parseInt(defaultCommentNumberFontSize)
-        chrome.storage.sync.set({ commentNumberFontSize }) // chrome.storageに保存
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+        commentNumberSlider.value = parseInt(defaultCommentNumberFontSize) || 100
+        saveSettings({ commentNumberFontSize }, true) // 即座に保存
+        updateCommentStyles(true) // 即座に更新
     })
 
     commentTextSlider.addEventListener('dblclick', function () {
         commentTextFontSize = defaultCommentTextFontSize
         commentTextSizeLabel.textContent = commentTextFontSize
-        commentTextSlider.value = parseInt(defaultCommentTextFontSize)
-        chrome.storage.sync.set({ commentTextFontSize }) // chrome.storageに保存
-        updateStyles(targetNode.querySelectorAll('.table-row'))
+        commentTextSlider.value = parseInt(defaultCommentTextFontSize) || 100
+        saveSettings({ commentTextFontSize }, true) // 即座に保存
+        updateCommentStyles(true) // 即座に更新
     })
 
     // ホイールイベントを追加
@@ -148,7 +259,7 @@ function insertSettingPanel(targetNode) {
         newValue = Math.min(300, Math.max(50, newValue)) // 範囲を制限
         slider.value = newValue
         sizeLabel.textContent = newValue + '%'
-        chrome.storage.sync.set({ [fontSizeKey]: newValue + '%' }) // 保存
+        saveSettings({ [fontSizeKey]: newValue + '%' }) // 保存
 
         // スタイルを更新
         if (fontSizeKey === 'commentNumberFontSize') {
@@ -156,7 +267,7 @@ function insertSettingPanel(targetNode) {
         } else {
             commentTextFontSize = newValue + '%' // 更新されたサイズをセット
         }
-        updateStyles(targetNode.querySelectorAll('.table-row')) // スタイルを更新
+        updateCommentStyles() // 遅延更新
     }
 
     // コメント番号ホイールイベント
@@ -169,17 +280,26 @@ function insertSettingPanel(targetNode) {
         handleMouseWheel(event, commentTextSlider, commentTextSizeLabel, 'commentTextFontSize')
     })
 
-    insertToggleButton() // トグルボタンをaddon-controller内に挿入
+    // ボタンは別途呼び出されるため、ここでは呼ばない
     watchFullscreenChange() // フルスクリーン時にボタン非表示
 }
-
 
 /**
  * 設定画面の表示・非表示ボタンを挿入
  */
 function insertToggleButton() {
-    const addonController = document.querySelector('.addon-controller')
-    if (addonController) {
+    try {
+        const addonController = document.querySelector('.addon-controller')
+        if (!addonController) {
+            // console.warn('addon-controller要素が見つかりません')
+            return
+        }
+
+        if (addonController.querySelector('.option-button')) {
+            // console.log('設定ボタンは既に存在します')
+            return
+        }
+
         const optionButton = document.createElement('button')
         optionButton.textContent = 'Aa'
         optionButton.style.backgroundColor = 'initial'
@@ -190,24 +310,62 @@ function insertToggleButton() {
 
         // 設定画面表示・非表示のトグル
         optionButton.addEventListener('click', function () {
-            const sliderContainer = document.querySelector('.setting-container')
-            if (sliderContainer) {
-                sliderContainer.style.display = sliderContainer.style.display === 'none' ? 'block' : 'none'
+            try {
+                const sliderContainer = document.querySelector('.setting-container')
+                if (sliderContainer) {
+                    sliderContainer.style.display = sliderContainer.style.display === 'none' ? 'block' : 'none'
+                } else {
+                    // console.warn('設定コンテナが見つかりません')
+                }
+            } catch (error) {
+                // console.warn('設定ボタンクリック処理中にエラーが発生しました:', error)
             }
         })
 
         // addon-controller内の最後にボタンを挿入
         addonController.appendChild(optionButton)
+    } catch (error) {
+        // console.warn('設定ボタンの挿入中にエラーが発生しました:', error)
     }
+}
+
+/**
+ * 新しいコメントの弾幕判定とクラス付与
+ */
+function processNewComments(newTableRows) {
+    if (!newTableRows || newTableRows.length === 0) return
+
+    // 新しいコメントのみを処理
+    newTableRows.forEach(row => {
+        const commentText = row.querySelector('.comment-text')
+        if (commentText) {
+            const comment = commentText.textContent || ''
+            const isDanmaku = isDanmakuComment(comment)
+            
+            // 弾幕クラスの付与
+            if (isDanmaku) {
+                commentText.classList.add('danmaku-comment')
+            } else {
+                commentText.classList.remove('danmaku-comment')
+            }
+        }
+    })
 }
 
 /**
  * 要素の挿入を監視
  */
 function checkElementInsert(targetNode) {
+    // 既存のObserverがある場合は切断
+    if (commentInsertObserver) {
+        commentInsertObserver.disconnect()
+    }
 
     // MutationObserverを作成
-    const observer = new MutationObserver(async function (mutations) {
+    commentInsertObserver = new MutationObserver(async function (mutations) {
+        let hasNewComments = false
+        let newTableRows = []
+
         mutations.forEach(function (mutation) {
             // 追加された要素を取得する
             const newNodes = mutation.addedNodes
@@ -218,258 +376,328 @@ function checkElementInsert(targetNode) {
                 return accumulator
             }, [])
 
-            updateStyles(targets)
+            targets.forEach(target => {
+                if (target.classList.contains('contents-tab-panel')) {
+                    attachWheelEventForAutoScroll()
+                    // ボタンは一度だけ作成するため、ここでは呼ばない
+                    return
+                }
+
+                if (target.classList.contains('table-row')) {
+                    hasNewComments = true
+                    newTableRows.push(target)
+                }
+
+                // 子要素の中にtable-rowがあるかチェック
+                const childRows = target.querySelectorAll('.table-row')
+                if (childRows.length > 0) {
+                    hasNewComments = true
+                    newTableRows.push(...Array.from(childRows))
+                }
+            })
         })
+
+        if (hasNewComments) {
+            // 新しいコメントの処理
+            setTimeout(() => {
+                processNewComments(newTableRows)
+                
+                // 自動スクロール処理
+                if (newTableRows.length > 0 && !isWheelActive) {
+                    const tableBody = newTableRows[0]?.parentElement?.parentElement
+                    if (tableBody) {
+                        const lastRow = newTableRows[newTableRows.length - 1]
+                        if (lastRow) {
+                            scrollToPosition(tableBody, lastRow.offsetTop - tableBody.offsetTop)
+                        }
+                    }
+                }
+            }, 100)
+        }
     })
 
     // MutationObserverを開始
-    observer.observe(targetNode, { childList: true, subtree: true })
+    commentInsertObserver.observe(targetNode, { childList: true, subtree: true })
 }
 
 /**
- * スタイルを適用
+ * CSS変数を更新してコメントスタイルを適用（最適化版）
  */
-function updateStyles(targets) {
-    const tableRows = []
+function updateCommentStyles(immediate = false) {
+    if (updateStylesTimeout) {
+        clearTimeout(updateStylesTimeout)
+    }
 
-    targets.forEach(target => {
-        if (target.classList.contains('contents-tab-panel')) {
-            attachWheelEventForAutoScroll()
-            addClickEvent_indicatorButton()
-            updateStyles(Array.from(target.querySelectorAll('.table-row')))
-            return
-        }
-
-        if (target.classList.contains('table-row')) {
-            tableRows.push(target)
-        }
-    })
-
-    if (tableRows.length > 0) {
-        const tableBody = tableRows[0]?.parentElement?.parentElement
-        if (!tableBody) return
-
-        setTimeout(() => {
-            changeCommentsStyles(tableRows)
-
-            setTimeout(() => {
-                const lastRow = tableRows[tableRows.length - 1]
-                if (lastRow && !isWheelActive) {
-                    scrollToPosition(tableBody, lastRow.offsetTop - tableBody.offsetTop)
-                }
-            }, 100)
-        }, isWheelActive ? 10 : 0)
+    if (immediate) {
+        // 即座に実行（チェックボックスなど）
+        applyCommentStyles()
+    } else {
+        // 遅延実行（スライダーなど）
+        updateStylesTimeout = setTimeout(() => {
+            applyCommentStyles()
+        }, 16) // 約60fps
     }
 }
 
 /**
- * コメントのスタイルを変更
+ * 実際のスタイル適用処理
  */
-function changeCommentsStyles(tableRows) {
-    if (!Array.isArray(tableRows) || tableRows.length === 0) return
-
-    const excludedTypes = [
-        'commentLock',
-        'userFollow',
-    ]
-
-    requestAnimationFrame(() => {
-
-        for (const row of tableRows) {
-            if (!row) continue
-
-            // 基本スタイル
-            row.style.cssText += `
-                height: auto;
-                min-height: 32px;
-                padding-top: 0.4rem;
-                padding-bottom: 0.4rem;
-                border-bottom: 1px solid rgba(150,150,150,0.4);
-            `
-
-            const commentNumber = row.querySelector('.comment-number')
-            const commentText = row.querySelector('.comment-text')
-            const commentType = row.getAttribute('data-comment-type') || ''
-
-            // 除外するコメントタイプ
-            if (excludedTypes.includes(commentType)) continue
-
-            // コメント番号のサイズを変更
-            if (commentNumber) {
-                commentNumber.style.fontSize = commentNumberFontSize
-            }
-
-            // コメントテキストのサイズを変更
-            if (commentText) {
-                commentText.style.fontSize = commentTextFontSize
-
-                const comment = commentText.textContent || ''
-                const isDanmaku = isDanmakuComment(comment)
-                const whiteSpace = isShowFullComment && !isDanmaku ? 'normal' : 'nowrap'
-
-                commentText.style.whiteSpace = whiteSpace
-            }
-        }
-    })
+function applyCommentStyles() {
+    // CSS変数のみ更新（DOM操作なし）
+    document.documentElement.style.setProperty('--comment-number-size', commentNumberFontSize)
+    document.documentElement.style.setProperty('--comment-text-size', commentTextFontSize)
+    document.documentElement.style.setProperty('--comment-wrap-mode', isShowFullComment ? 'normal' : 'nowrap')
 }
 
-function autoScroll(tableBody, tableRow) {
-    // コメントサイズ分スクロール
-    if (!isWheelActive) scrollToPosition(tableBody, tableRow.offsetHeight)
+/**
+ * コメント用のCSSスタイルルールを作成
+ */
+function createCommentStyles() {
+    // 既存のスタイルが存在する場合は削除
+    const existingStyle = document.getElementById('comment-resize-styles')
+    if (existingStyle) {
+        existingStyle.remove()
+    }
+
+    const style = document.createElement('style')
+    style.id = 'comment-resize-styles'
+    style.textContent = `
+        :root {
+            --comment-number-size: ${commentNumberFontSize};
+            --comment-text-size: ${commentTextFontSize};
+            --comment-wrap-mode: ${isShowFullComment ? 'normal' : 'nowrap'};
+        }
+        
+        .table-row {
+            height: auto !important;
+            min-height: 32px !important;
+            padding-top: 0.4rem !important;
+            padding-bottom: 0.4rem !important;
+            border-bottom: 1px solid rgba(150,150,150,0.4) !important;
+        }
+        
+        .comment-number {
+            font-size: var(--comment-number-size) !important;
+        }
+        
+        .comment-text {
+            font-size: var(--comment-text-size) !important;
+            white-space: var(--comment-wrap-mode) !important;
+        }
+        
+        .danmaku-comment {
+            white-space: nowrap !important;
+        }
+    `
+    document.head.appendChild(style)
 }
 
 // スクロール
 function scrollToPosition(tableBody, position = 'bottom') {
-    if (!tableBody) return
+    try {
+        if (!tableBody) {
+            // console.warn('スクロール対象の要素が見つかりません')
+            return
+        }
 
-    const isBottom = position === 'bottom'
-    const isNumber = typeof position === 'number'
+        // scrollToメソッドの存在確認
+        if (typeof tableBody.scrollTo !== 'function') {
+            // console.warn('scrollToメソッドが利用できません')
+            return
+        }
 
-    tableBody.scrollTo({
-        top: isBottom
-            ? tableBody.scrollHeight
-            : tableBody.scrollTop + (isNumber ? position : 0),
-        behavior: 'auto'
-    })
+        const isBottom = position === 'bottom'
+        const isNumber = typeof position === 'number'
+
+        const scrollOptions = {
+            top: isBottom
+                ? tableBody.scrollHeight || 0
+                : (tableBody.scrollTop || 0) + (isNumber ? position : 0),
+            behavior: 'auto'
+        }
+
+        tableBody.scrollTo(scrollOptions)
+    } catch (error) {
+        // console.warn('スクロール実行中にエラーが発生しました:', error)
+    }
 }
 
 // スクロール位置が一番下にあるか
 function isScrollAtBottom() {
-    const tableBody = document.querySelector('[class*="_body_"]')
-    // 要素のスクロール位置と高さを取得
-    const scrollTop = tableBody.scrollTop; // 現在のスクロール位置
-    const scrollHeight = tableBody.scrollHeight; // コンテンツの全体の高さ
-    const clientHeight = tableBody.clientHeight; // 表示領域の高さ
+    try {
+        const tableBody = document.querySelector('[class*="_body_"]')
+        if (!tableBody) {
+            // console.warn('スクロール要素が見つかりません')
+            return false
+        }
 
-    // スクロールバーが一番下にあるかをチェック
-    return scrollTop + clientHeight >= scrollHeight - 1;
+        // 要素のスクロール位置と高さを取得
+        const scrollTop = tableBody.scrollTop || 0
+        const scrollHeight = tableBody.scrollHeight || 0
+        const clientHeight = tableBody.clientHeight || 0
+
+        // スクロールバーが一番下にあるかをチェック
+        return scrollTop + clientHeight >= scrollHeight - 1
+    } catch (error) {
+        // console.warn('スクロール位置の確認中にエラーが発生しました:', error)
+        return false
+    }
 }
 
 function addClickEvent_indicatorButton() {
-    const playerSection = document.querySelector('[class*="_player-section_"]')
-    if (!playerSection) return
-
-    // MutationObserverで`indicator`の追加を監視
-    const observer = new MutationObserver(() => {
-        const indicator = playerSection.querySelector('[class*="_indicator_"]')
-        if (indicator && !indicator.dataset.myEventAdded) {
-            // イベントが未登録の場合のみ追加
-            indicator.addEventListener('click', handleIndicatorClick)
-            indicator.dataset.myEventAdded = 'true' // フラグを設定して再登録を防止
+    try {
+        const playerSection = document.querySelector('[class*="_player-section_"]')
+        if (!playerSection) {
+            // console.warn('player-section要素が見つかりません')
+            return
         }
-    })
 
-    // `playerSection` 内のDOM変更を監視
-    observer.observe(playerSection, {
-        childList: true,
-        subtree: true,
-    })
-
-    // イベントハンドラー関数
-    function handleIndicatorClick(e) {
-        const emotionButton = document.querySelector('[class*="_emotion-button_"]')
-        const lockItemArea = document.querySelector('[class*="_lock-item-area_"]')
-        const nageadButton = lockItemArea?.querySelector('[data-content-type="nagead"]')
-
-        if (emotionButton) {
-            emotionButton.click()
-            setTimeout(() => emotionButton.click(), 100)
-        } else if (nageadButton) {
-            nageadButton.click()
-            setTimeout(() => nageadButton.click(), 100)
+        // 既存のObserverがある場合は切断
+        if (indicatorButtonObserver) {
+            indicatorButtonObserver.disconnect()
         }
+
+        // MutationObserverで`indicator`の追加を監視
+        indicatorButtonObserver = new MutationObserver(() => {
+            try {
+                const indicator = playerSection.querySelector('[class*="_indicator_"]')
+                if (indicator && !indicator.dataset.myEventAdded) {
+                    // イベントが未登録の場合のみ追加
+                    indicator.addEventListener('click', handleIndicatorClick)
+                    indicator.dataset.myEventAdded = 'true' // フラグを設定して再登録を防止
+                }
+            } catch (error) {
+                // console.warn('インジケータ監視中にエラーが発生しました:', error)
+            }
+        })
+
+        // `playerSection` 内のDOM変更を監視
+        indicatorButtonObserver.observe(playerSection, {
+            childList: true,
+            subtree: true,
+        })
+
+        // イベントハンドラー関数
+        function handleIndicatorClick(e) {
+            try {
+                const emotionButton = document.querySelector('[class*="_emotion-button_"]')
+                const lockItemArea = document.querySelector('[class*="_lock-item-area_"]')
+                const nageadButton = lockItemArea?.querySelector('[data-content-type="nagead"]')
+
+                if (emotionButton) {
+                    emotionButton.click()
+                    setTimeout(() => {
+                        try {
+                            emotionButton.click()
+                        } catch (error) {
+                            // console.warn('emotionButtonクリック中にエラーが発生しました:', error)
+                        }
+                    }, 100)
+                } else if (nageadButton) {
+                    nageadButton.click()
+                    setTimeout(() => {
+                        try {
+                            nageadButton.click()
+                        } catch (error) {
+                            // console.warn('nageadButtonクリック中にエラーが発生しました:', error)
+                        }
+                    }, 100)
+                }
+            } catch (error) {
+                // console.warn('インジケータクリック処理中にエラーが発生しました:', error)
+            }
+        }
+    } catch (error) {
+        // console.warn('インジケータボタンイベント設定中にエラーが発生しました:', error)
     }
 }
 
 // 弾幕判定関数
 function isDanmakuComment(comment) {
-    const totalLength = comment.length
-    if (totalLength === 0) return false
+    try {
+        // 入力値の検証
+        if (!comment || typeof comment !== 'string') {
+            return false
+        }
 
-    // 通常のコメントを抽出する正規表現
-    const regex = /[ぁ-ゟ゠-ヿ一-龯ａ-ｚＡ-Ｚa-zA-Z0-9０-９]/g
+        const totalLength = comment.length
+        if (totalLength === 0) return false
 
-    // 弾幕文字の割合を計算
-    const danmakuCount = (comment.replace(regex, '') || []).length
-    const danmakuRatio = danmakuCount / totalLength
+        // 通常のコメントを抽出する正規表現
+        const regex = /[ぁ-ゟ゠-ヿ一-龯ａ-ｚＡ-Ｚa-zA-Z0-9０-９]/g
 
-    // 判定
-    const isNormalTextHeavy = (Math.round(danmakuRatio * 10) / 10) >= 0.5
+        // 弾幕文字の割合を計算
+        const danmakuCount = (comment.replace(regex, '') || '').length
+        const danmakuRatio = danmakuCount / totalLength
 
-    return isNormalTextHeavy
+        // 判定
+        const isNormalTextHeavy = (Math.round(danmakuRatio * 10) / 10) >= 0.5
+
+        return isNormalTextHeavy
+    } catch (error) {
+        // console.warn('弾幕判定中にエラーが発生しました:', error)
+        return false
+    }
 }
 
 // フルスクリーン時にボタン非表示
 function watchFullscreenChange() {
-    const optionButton = document.getElementsByClassName('option-button')[0]
+    try {
+        const optionButton = document.getElementsByClassName('option-button')[0]
 
-    if (!optionButton) return
-
-    const observer = new ResizeObserver(entries => {
-        for (const entry of entries) {
-            const elementWidth = entry.contentRect.width
-            const windowWidth = window.innerWidth
-
-            if (elementWidth === windowWidth) {
-                optionButton.style.display = 'none'
-            } else {
-                optionButton.style.display = ''
-            }
+        if (!optionButton) {
+            // console.warn('option-button要素が見つかりません')
+            return
         }
-    })
 
-    const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
-    elements.forEach(el => observer.observe(el))
+        // 既存のObserverがある場合は切断
+        if (fullscreenObserver) {
+            fullscreenObserver.disconnect()
+        }
+
+        fullscreenObserver = new ResizeObserver(entries => {
+            try {
+                for (const entry of entries) {
+                    const elementWidth = entry.contentRect.width
+                    const windowWidth = window.innerWidth
+
+                    if (elementWidth === windowWidth) {
+                        optionButton.style.display = 'none'
+                    } else {
+                        optionButton.style.display = ''
+                    }
+                }
+            } catch (error) {
+                // console.warn('フルスクリーン監視中にエラーが発生しました:', error)
+            }
+        })
+
+        const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
+        if (elements.length === 0) {
+            // console.warn('フルスクリーン監視対象の要素が見つかりません')
+            return
+        }
+
+        elements.forEach(el => {
+            try {
+                fullscreenObserver.observe(el)
+            } catch (error) {
+                // console.warn('要素の監視開始中にエラーが発生しました:', error)
+            }
+        })
+    } catch (error) {
+        // console.warn('フルスクリーン監視設定中にエラーが発生しました:', error)
+    }
 }
 
+// ページアンロード時のクリーンアップ
+window.addEventListener('beforeunload', () => {
+    cleanupResources()
+})
 
-// // 矢印（下へ）ボタンがあるかどうか
-// function isIndicatorButton() {
-//     const playerSection = document.querySelector('[class*="_player-section_"]')
-//     const indicator = playerSection?.querySelector('[class*="_indicator_"]')
-//     if (!indicator) return false
-
-//     return true
-// }
-
-// // 矢印（下へ）ボタンをクリック
-// function clickIndicatorButton() {
-//     const playerSection = document.querySelector('[class*="_player-section_"]')
-//     const indicator = playerSection?.querySelector('[class*="_indicator_"]')
-//     if (indicator) indicator.click()
-// }
-
-
-// function testButton() {
-//     // ボタンを作成
-//     const button = document.createElement('button')
-//     button.textContent = 'TEST!'
-//     button.style.position = 'fixed'
-//     button.style.bottom = '20px'
-//     button.style.right = '20px'
-//     button.style.padding = '10px 20px'
-//     button.style.backgroundColor = '#007bff'
-//     button.style.color = '#fff'
-//     button.style.border = 'none'
-//     button.style.borderRadius = '5px'
-//     button.style.cursor = 'pointer'
-//     button.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.1)'
-//     button.style.zIndex = '9999'
-
-//     // ボタンにホバー効果を追加
-//     button.addEventListener('mouseover', () => {
-//         button.style.backgroundColor = '#0056b3'
-//     })
-//     button.addEventListener('mouseout', () => {
-//         button.style.backgroundColor = '#007bff'
-//     })
-
-//     // ボタンクリック時の動作を定義
-//     button.addEventListener('click', () => {
-//         // fix()
-//     })
-
-//     // ボタンをドキュメントに追加
-//     document.body.appendChild(button)
-// }
-
+// ページ非表示時のクリーンアップ（オプション）
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        // ページが非表示になった時の処理（必要に応じて）
+    }
+})
