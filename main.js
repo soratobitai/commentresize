@@ -2,10 +2,12 @@
 const defaultCommentNumberFontSize = '100%'
 const defaultCommentTextFontSize = '100%'
 const defaultIsShowFullComment = false
+const defaultIsExtensionEnabled = true // 機能拡張の有効/無効のデフォルト値
 
 let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
+let isExtensionEnabled = defaultIsExtensionEnabled // 機能拡張の有効/無効フラグ
 let isWheelActive = false // スクロール中かどうかのフラグ
 let saveTimeout = null // 保存の遅延用タイマー
 let updateStylesTimeout = null // スタイル更新の遅延用タイマー
@@ -25,7 +27,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!targetNode) return
 
     // chrome.storageから設定を取得
-    chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment'], (result) => {
+    chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment', 'isExtensionEnabled'], (result) => {
         // エラーハンドリング
         if (chrome.runtime.lastError) {
             // console.warn('設定の読み出しに失敗しました:', chrome.runtime.lastError)
@@ -35,10 +37,67 @@ document.addEventListener('DOMContentLoaded', () => {
         commentNumberFontSize = result.commentNumberFontSize || defaultCommentNumberFontSize
         commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
+        isExtensionEnabled = (typeof result.isExtensionEnabled === 'boolean') ? result.isExtensionEnabled : defaultIsExtensionEnabled
+
+        // 設定画面と設定ボタンは常に表示
+        insertSettingPanel(targetNode)
+        setTimeout(() => {
+            insertToggleButton()
+        }, 1000)
 
         // コメントの挿入を監視してから初期化を開始
         startCommentMonitoring(targetNode)
     })
+
+    // --- ここからエモーションボタン監視追加 ---
+    function handleEmotionButtonClick() {
+        const hasTabPanel = document.querySelector('.contents-tab-panel') !== null
+        if (!hasTabPanel) {
+            // 無ければ無効化
+            if (!isExtensionEnabled) return
+            isExtensionEnabled = false
+            removeCommentStyles()
+            document.documentElement.style.removeProperty('--comment-number-size')
+            document.documentElement.style.removeProperty('--comment-text-size')
+            document.documentElement.style.removeProperty('--comment-wrap-mode')
+            addNoBorderStyle()
+        } else {
+            // あれば◯秒後に有効化
+            setTimeout(() => {
+                if (isExtensionEnabled) return
+                isExtensionEnabled = true
+                createCommentStyles()
+                updateCommentStyles(true)
+                attachWheelEventForAutoScroll()
+                removeNoBorderStyle()
+                // 有効化後に自動スクロール
+                scrollToPosition()
+            }, 500)
+        }
+    }
+
+    // エモーションボタンを監視してイベントを付与
+    function observeEmotionButton() {
+        const tryAttach = () => {
+            const btn = document.querySelector('[class*="_emotion-button_"]')
+            if (btn && !btn.__extensionEmotionListenerAdded) {
+                btn.addEventListener('click', handleEmotionButtonClick)
+                btn.__extensionEmotionListenerAdded = true
+            }
+            // ギフトボタンにも同じ動作を設定
+            const giftBtn = document.querySelector('button.___item___qkXEW[data-content-type="nagead"]')
+            if (giftBtn && !giftBtn.__extensionGiftListenerAdded) {
+                giftBtn.addEventListener('click', handleEmotionButtonClick)
+                giftBtn.__extensionGiftListenerAdded = true
+            }
+        }
+        // 初回即時実行
+        tryAttach()
+        // 以降は定期的に監視（MutationObserverでも可だが簡易にIntervalで）
+        setInterval(tryAttach, 1000)
+    }
+    observeEmotionButton()
+    // --- ここまでエモーションボタン監視追加 ---
 })
 
 /**
@@ -52,6 +111,9 @@ function startCommentMonitoring(targetNode) {
 
     // MutationObserverを作成
     commentInsertObserver = new MutationObserver(async function (mutations) {
+        // 機能拡張が無効の場合は処理をスキップ
+        if (!isExtensionEnabled) return
+
         let hasNewComments = false
         let newTableRows = []
 
@@ -67,6 +129,7 @@ function startCommentMonitoring(targetNode) {
 
             targets.forEach(target => {
                 if (target.classList.contains('contents-tab-panel')) {
+
                     // 初期化が完了していない場合は初期化を実行
                     if (!isInitialized) {
                         scheduleInitialization(targetNode)
@@ -95,20 +158,19 @@ function startCommentMonitoring(targetNode) {
 
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
-            setTimeout(() => {
-                processNewComments(newTableRows)
-                
-                // 自動スクロール処理
-                if (newTableRows.length > 0 && !isWheelActive && isScrollAtBottom()) {
-                    const tableBody = newTableRows[0]?.parentElement?.parentElement
-                    if (tableBody) {
-                        const lastRow = newTableRows[newTableRows.length - 1]
-                        if (lastRow) {
-                            scrollToPosition(lastRow.offsetTop - tableBody.offsetTop)
-                        }
+
+            processNewComments(newTableRows)
+
+            // 自動スクロール処理
+            if (newTableRows.length > 0 && !isWheelActive && isScrollAtBottom()) {
+                const tableBody = newTableRows[0]?.parentElement?.parentElement
+                if (tableBody) {
+                    const lastRow = newTableRows[newTableRows.length - 1]
+                    if (lastRow) {
+                        scrollToPosition(lastRow.offsetTop - tableBody.offsetTop)
                     }
                 }
-            }, 500)
+            }
         }
     })
 
@@ -146,19 +208,11 @@ function initializeApp(targetNode) {
     // CSSスタイルルールを作成
     createCommentStyles()
 
-    // 設定画面を追加
-    insertSettingPanel(targetNode)
-
     // 初期スタイルを適用
     updateCommentStyles(true) // 即座に更新
 
     // ホイールイベントを追加
     attachWheelEventForAutoScroll()
-
-    // 設定ボタンを追加（少し遅延させてDOMの準備を待つ）
-    setTimeout(() => {
-        insertToggleButton()
-    }, 1000)
 }
 
 /**
@@ -227,6 +281,9 @@ function cleanupResources() {
 
 function attachWheelEventForAutoScroll() {
     try {
+        // 機能拡張が無効の場合はスキップ
+        if (!isExtensionEnabled) return
+
         // 既にイベントが追加されている場合はスキップ
         if (isWheelEventAttached) return
 
@@ -239,6 +296,9 @@ function attachWheelEventForAutoScroll() {
 
         tableBody.addEventListener('wheel', () => {
             try {
+                // 機能拡張が無効の場合は処理をスキップ
+                if (!isExtensionEnabled) return
+
                 isWheelActive = true // ホイール操作中はtrueに設定
 
                 // 既存のタイマーをクリアして再設定
@@ -278,18 +338,58 @@ function insertSettingPanel(targetNode) {
     sliderContainer.style.display = 'none' // 初期状態
 
     sliderContainer.innerHTML = `
-        <div style="padding:20px; border-top: 1px solid #ccc;">
-            <label>番号サイズ: <span id="comment-number-size">${commentNumberFontSize}</span></label>
-            <input id="commentNumberSlider" type="range" min="50" max="300" value="${parseInt(commentNumberFontSize) || 100}" style="width: 100%;">
-            <br>
-            <label>コメントサイズ: <span id="comment-text-size">${commentTextFontSize}</span></label>
-            <input id="commentTextSlider" type="range" min="50" max="300" value="${parseInt(commentTextFontSize) || 100}" style="width: 100%;">
-            <br>
-            <div style="margin-top: 10px;">
-                <label>
-                    <input type="checkbox" id="isShowFullCommentCheckbox" ${isShowFullComment ? 'checked' : ''}>
-                    長いコメントを折り返す
-                </label>
+        <div style="
+            max-width: 350px;
+            margin: 0 auto;
+            background: linear-gradient(135deg, #f8fafc 0%, #e0e7ff 100%);
+            box-shadow: 0 8px 32px rgba(60,60,120,0.12), 0 1.5px 4px rgba(60,60,120,0.08);
+            padding: 28px 24px 20px 24px;
+            border: 1.5px solid #d1d5db;
+            font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+        ">
+            <!-- 機能拡張の有効/無効トグル -->
+            <div style="margin-bottom: 28px;">
+                <div style="display: flex; align-items: center; justify-content: space-between;">
+                    <span style="color: #4f46e5; font-weight: bold; font-size: 18px; letter-spacing: 0.03em;">機能拡張</span>
+                    <div class="toggle-switch" style="position: relative; width: 44px; height: 22px; background: ${isExtensionEnabled ? '#4CAF50' : '#cbd5e1'}; border-radius: 11px; cursor: pointer; transition: background 0.3s; box-shadow: 0 2px 8px rgba(76,175,80,0.08);">
+                        <div class="toggle-slider" style="position: absolute; top: 2px; left: ${isExtensionEnabled ? '23px' : '2px'}; width: 18px; height: 18px; background: white; border-radius: 50%; transition: left 0.3s; box-shadow: 0 2px 8px rgba(60,60,120,0.10);"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 設定項目カード -->
+            <div style="
+                opacity: ${isExtensionEnabled ? '1' : '0.5'};
+                pointer-events: ${isExtensionEnabled ? 'auto' : 'none'};
+                transition: opacity 0.3s;
+                background: #fff;
+                border-radius: 12px;
+                box-shadow: 0 2px 8px rgba(60,60,120,0.06);
+                padding: 18px 16px 10px 16px;
+                margin-bottom: 10px;
+                border: 1px solid #e0e7ff;
+            ">
+                <div style="margin-bottom: 18px;">
+                    <label style="font-size: 15px; color: #374151; font-weight: 500;">番号サイズ
+                        <span id="comment-number-size" style="margin-left: 8px; color: #6366f1; font-size: 15px;">${commentNumberFontSize}</span>
+                    </label>
+                    <input id="commentNumberSlider" type="range" min="50" max="300" value="${parseInt(commentNumberFontSize) || 100}"
+                        style="width: 100%; margin-top: 6px; accent-color: #6366f1; height: 4px; border-radius: 2px;">
+                </div>
+                <div style="margin-bottom: 18px;">
+                    <label style="font-size: 15px; color: #374151; font-weight: 500;">コメントサイズ
+                        <span id="comment-text-size" style="margin-left: 8px; color: #6366f1; font-size: 15px;">${commentTextFontSize}</span>
+                    </label>
+                    <input id="commentTextSlider" type="range" min="50" max="300" value="${parseInt(commentTextFontSize) || 100}"
+                        style="width: 100%; margin-top: 6px; accent-color: #6366f1; height: 4px; border-radius: 2px;">
+                </div>
+                <div style="margin-top: 10px; display: flex; align-items: center;">
+                    <label style="font-size: 15px; color: #374151; font-weight: 500; display: flex; align-items: center; cursor: pointer;">
+                        <input type="checkbox" id="isShowFullCommentCheckbox" ${isShowFullComment ? 'checked' : ''}
+                            style="width: 18px; height: 18px; accent-color: #6366f1; margin-right: 8px;">
+                        長いコメントを折り返す
+                    </label>
+                </div>
             </div>
         </div>
     `
@@ -302,8 +402,47 @@ function insertSettingPanel(targetNode) {
     const commentTextSizeLabel = document.getElementById('comment-text-size')
     const isShowFullCommentCheckbox = document.getElementById('isShowFullCommentCheckbox')
 
+    // 有効/無効状態に応じてdisabled属性をセット
+    commentNumberSlider.disabled = !isExtensionEnabled
+    commentTextSlider.disabled = !isExtensionEnabled
+    isShowFullCommentCheckbox.disabled = !isExtensionEnabled
+
+    // 機能拡張の有効/無効トグルイベント
+    const toggleSwitch = sliderContainer.querySelector('.toggle-switch')
+    toggleSwitch.addEventListener('click', function() {
+        isExtensionEnabled = !isExtensionEnabled
+        
+        // 設定パネルの表示状態を記憶
+        const oldPanel = document.querySelector('.setting-container')
+        const prevDisplay = oldPanel ? oldPanel.style.display : ''
+        if (oldPanel) oldPanel.remove()
+        insertSettingPanel(targetNode)
+        // 新しいパネルに表示状態を復元
+        const newPanel = document.querySelector('.setting-container')
+        if (newPanel && prevDisplay) newPanel.style.display = prevDisplay
+
+        // 設定を保存
+        saveSettings({ isExtensionEnabled }, true)
+        
+        // 機能拡張の状態に応じて処理を実行
+        if (isExtensionEnabled) {
+            createCommentStyles() // スタイルを再作成
+            updateCommentStyles(true)
+            attachWheelEventForAutoScroll()
+            removeNoBorderStyle() // ボーダー消去スタイルを削除
+        } else {
+            removeCommentStyles() // スタイルを削除
+            document.documentElement.style.removeProperty('--comment-number-size')
+            document.documentElement.style.removeProperty('--comment-text-size')
+            document.documentElement.style.removeProperty('--comment-wrap-mode')
+            addNoBorderStyle() // ボーダー消去スタイルを追加
+        }
+    })
+
     // チェックボックスの変更イベント
     isShowFullCommentCheckbox.addEventListener('change', function () {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         isShowFullComment = this.checked
         saveSettings({ isShowFullComment }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
@@ -311,6 +450,8 @@ function insertSettingPanel(targetNode) {
 
     // スライダーのイベントリスナー
     commentNumberSlider.addEventListener('input', function () {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         commentNumberFontSize = this.value + '%'
         commentNumberSizeLabel.textContent = commentNumberFontSize
         saveSettings({ commentNumberFontSize }) // 遅延保存
@@ -318,6 +459,8 @@ function insertSettingPanel(targetNode) {
     })
 
     commentTextSlider.addEventListener('input', function () {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         commentTextFontSize = this.value + '%'
         commentTextSizeLabel.textContent = commentTextFontSize
         saveSettings({ commentTextFontSize }) // 遅延保存
@@ -326,6 +469,8 @@ function insertSettingPanel(targetNode) {
 
     // ダブルクリックでデフォルトサイズにリセット
     commentNumberSlider.addEventListener('dblclick', function () {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         commentNumberFontSize = defaultCommentNumberFontSize
         commentNumberSizeLabel.textContent = commentNumberFontSize
         commentNumberSlider.value = parseInt(defaultCommentNumberFontSize) || 100
@@ -334,6 +479,8 @@ function insertSettingPanel(targetNode) {
     })
 
     commentTextSlider.addEventListener('dblclick', function () {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         commentTextFontSize = defaultCommentTextFontSize
         commentTextSizeLabel.textContent = commentTextFontSize
         commentTextSlider.value = parseInt(defaultCommentTextFontSize) || 100
@@ -343,6 +490,8 @@ function insertSettingPanel(targetNode) {
 
     // ホイールイベントを追加
     const handleMouseWheel = (event, slider, sizeLabel, fontSizeKey) => {
+        if (!isExtensionEnabled) return // 機能拡張が無効の場合は処理をスキップ
+        
         event.preventDefault() // デフォルトのスクロールを無効化
         const step = 1 // サイズ変更のステップ
         let newValue = parseInt(slider.value) + (event.deltaY > 0 ? -step : step)
@@ -396,11 +545,24 @@ function insertToggleButton() {
         optionButton.classList.add('option-button')
 
         // 設定画面表示・非表示のトグル
-        optionButton.addEventListener('click', function () {
+        optionButton.addEventListener('click', function (event) {
             try {
                 const sliderContainer = document.querySelector('.setting-container')
                 if (sliderContainer) {
-                    sliderContainer.style.display = sliderContainer.style.display === 'none' ? 'block' : 'none'
+                    const isOpen = sliderContainer.style.display !== 'none'
+                    sliderContainer.style.display = isOpen ? 'none' : 'block'
+
+                    // パネルを開いたときのみ外側クリックで閉じるリスナーを追加
+                    if (!isOpen) {
+                        // まず既存のリスナーを削除
+                        document.removeEventListener('mousedown', handleOutsideClick)
+                        // 新たに追加
+                        setTimeout(() => {
+                            document.addEventListener('mousedown', handleOutsideClick)
+                        }, 0)
+                    } else {
+                        document.removeEventListener('mousedown', handleOutsideClick)
+                    }
                 } else {
                     // console.warn('設定コンテナが見つかりません')
                 }
@@ -419,10 +581,24 @@ function insertToggleButton() {
     }
 }
 
+// 設定パネル外クリックで閉じる
+function handleOutsideClick(event) {
+    const sliderContainer = document.querySelector('.setting-container')
+    if (!sliderContainer) return
+    const optionButton = document.querySelector('.option-button')
+    // パネル内またはAaボタン自体をクリックした場合は閉じない
+    if (sliderContainer.contains(event.target) || optionButton.contains(event.target)) return
+    sliderContainer.style.display = 'none'
+    document.removeEventListener('mousedown', handleOutsideClick)
+}
+
 /**
  * 新しいコメントの弾幕判定とクラス付与
  */
 function processNewComments(newTableRows) {
+    // 機能拡張が無効の場合は処理をスキップ
+    if (!isExtensionEnabled) return
+    
     if (!newTableRows || newTableRows.length === 0) return
 
     // 新しいコメントのみを処理
@@ -446,6 +622,9 @@ function processNewComments(newTableRows) {
  * CSS変数を更新してコメントスタイルを適用（最適化版）
  */
 function updateCommentStyles(immediate = false) {
+    // 機能拡張が無効の場合は処理をスキップ
+    if (!isExtensionEnabled) return
+
     if (updateStylesTimeout) {
         clearTimeout(updateStylesTimeout)
     }
@@ -465,6 +644,9 @@ function updateCommentStyles(immediate = false) {
  * 実際のスタイル適用処理
  */
 function applyCommentStyles() {
+    // 機能拡張が無効の場合は処理をスキップ
+    if (!isExtensionEnabled) return
+
     // CSS変数のみ更新（DOM操作なし）
     document.documentElement.style.setProperty('--comment-number-size', commentNumberFontSize)
     document.documentElement.style.setProperty('--comment-text-size', commentTextFontSize)
@@ -480,6 +662,9 @@ function createCommentStyles() {
     if (existingStyle) {
         existingStyle.remove()
     }
+
+    // 機能拡張が無効の場合はスタイルを作成しない
+    if (!isExtensionEnabled) return
 
     const style = document.createElement('style')
     style.id = 'comment-resize-styles'
@@ -512,6 +697,16 @@ function createCommentStyles() {
         }
     `
     document.head.appendChild(style)
+}
+
+/**
+ * コメント用のCSSスタイルルールを削除
+ */
+function removeCommentStyles() {
+    const existingStyle = document.getElementById('comment-resize-styles')
+    if (existingStyle) {
+        existingStyle.remove()
+    }
 }
 
 // スクロール
@@ -659,3 +854,24 @@ document.addEventListener('visibilitychange', () => {
         // ページが非表示になった時の処理（必要に応じて）
     }
 })
+
+/**
+ * .table-row の border-bottom を消すスタイルを追加
+ */
+function addNoBorderStyle() {
+    let style = document.getElementById('no-border-style')
+    if (!style) {
+        style = document.createElement('style')
+        style.id = 'no-border-style'
+        style.textContent = `.table-row { border-bottom: none !important; }`
+        document.head.appendChild(style)
+    }
+}
+
+/**
+ * .table-row の border-bottom を消すスタイルを削除
+ */
+function removeNoBorderStyle() {
+    const style = document.getElementById('no-border-style')
+    if (style) style.remove()
+}
