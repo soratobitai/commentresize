@@ -7,16 +7,16 @@ let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
 let isWheelActive = false // スクロール中かどうかのフラグ
-let isButtonInserted = false // ボタン挿入フラグ
 let saveTimeout = null // 保存の遅延用タイマー
 let updateStylesTimeout = null // スタイル更新の遅延用タイマー
 
 // リソース管理用のグローバル変数
 let wheelEventTimeout = null // ホイールイベント用タイマー
 let commentInsertObserver = null // コメント挿入監視用Observer
-let indicatorButtonObserver = null // インジケータボタン監視用Observer
 let fullscreenObserver = null // フルスクリーン監視用Observer
 let isWheelEventAttached = false // ホイールイベント重複防止フラグ
+let isInitialized = false // 初期化完了フラグ
+let initializationTimeout = null // 初期化用タイマー
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -36,10 +36,108 @@ document.addEventListener('DOMContentLoaded', () => {
         commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
 
-        // 初期化を即座に開始
-        initializeApp(targetNode)
+        // コメントの挿入を監視してから初期化を開始
+        startCommentMonitoring(targetNode)
     })
 })
+
+/**
+ * コメント監視を開始し、最初のコメントが挿入されてから初期化を実行
+ */
+function startCommentMonitoring(targetNode) {
+    // 既存のObserverがある場合は切断
+    if (commentInsertObserver) {
+        commentInsertObserver.disconnect()
+    }
+
+    // MutationObserverを作成
+    commentInsertObserver = new MutationObserver(async function (mutations) {
+        let hasNewComments = false
+        let newTableRows = []
+
+        mutations.forEach(function (mutation) {
+            // 追加された要素を取得する
+            const newNodes = mutation.addedNodes
+            const targets = Array.from(newNodes).reduce((accumulator, node) => {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    accumulator.push(node)
+                }
+                return accumulator
+            }, [])
+
+            targets.forEach(target => {
+                if (target.classList.contains('contents-tab-panel')) {
+                    // 初期化が完了していない場合は初期化を実行
+                    if (!isInitialized) {
+                        scheduleInitialization(targetNode)
+                    }
+                    return
+                }
+
+                if (target.classList.contains('table-row')) {
+                    hasNewComments = true
+                    newTableRows.push(target)
+                }
+
+                // 子要素の中にtable-rowがあるかチェック
+                const childRows = target.querySelectorAll('.table-row')
+                if (childRows.length > 0) {
+                    hasNewComments = true
+                    newTableRows.push(...Array.from(childRows))
+                }
+            })
+        })
+
+        // 最初のコメントが挿入された場合、初期化をスケジュール
+        if (hasNewComments && !isInitialized) {
+            scheduleInitialization(targetNode)
+        }
+
+        // 初期化が完了している場合は通常のコメント処理を実行
+        if (hasNewComments && isInitialized) {
+            setTimeout(() => {
+                processNewComments(newTableRows)
+                
+                // 自動スクロール処理
+                if (newTableRows.length > 0 && !isWheelActive && isScrollAtBottom()) {
+                    const tableBody = newTableRows[0]?.parentElement?.parentElement
+                    if (tableBody) {
+                        const lastRow = newTableRows[newTableRows.length - 1]
+                        if (lastRow) {
+                            scrollToPosition(lastRow.offsetTop - tableBody.offsetTop)
+                        }
+                    }
+                }
+            }, 500)
+        }
+    })
+
+    // MutationObserverを開始
+    commentInsertObserver.observe(targetNode, { childList: true, subtree: true })
+}
+
+/**
+ * 初期化をスケジュール
+ */
+function scheduleInitialization(targetNode) {
+    // 既存のタイマーをクリア
+    if (initializationTimeout) {
+        clearTimeout(initializationTimeout)
+    }
+
+    // 1秒後に初期化を実行
+    initializationTimeout = setTimeout(() => {
+        if (!isInitialized) {
+            initializeApp(targetNode)
+            isInitialized = true
+            
+            // 初期化後にスクロール位置を調整
+            setTimeout(() => {
+                scrollToPosition()
+            }, 300)
+        }
+    }, 500)
+}
 
 /**
  * アプリケーションの初期化
@@ -51,20 +149,11 @@ function initializeApp(targetNode) {
     // 設定画面を追加
     insertSettingPanel(targetNode)
 
-    // コメントの挿入を監視
-    checkElementInsert(targetNode)
-
     // 初期スタイルを適用
     updateCommentStyles(true) // 即座に更新
 
     // ホイールイベントを追加
     attachWheelEventForAutoScroll()
-
-    // インジケータボタンのイベントを追加（一度だけ）
-    if (!isButtonInserted) {
-        addClickEvent_indicatorButton()
-        isButtonInserted = true
-    }
 
     // 設定ボタンを追加（少し遅延させてDOMの準備を待つ）
     setTimeout(() => {
@@ -116,15 +205,15 @@ function cleanupResources() {
         clearTimeout(wheelEventTimeout)
         wheelEventTimeout = null
     }
+    if (initializationTimeout) {
+        clearTimeout(initializationTimeout)
+        initializationTimeout = null
+    }
 
     // Observerのクリーンアップ
     if (commentInsertObserver) {
         commentInsertObserver.disconnect()
         commentInsertObserver = null
-    }
-    if (indicatorButtonObserver) {
-        indicatorButtonObserver.disconnect()
-        indicatorButtonObserver = null
     }
     if (fullscreenObserver) {
         fullscreenObserver.disconnect()
@@ -133,6 +222,7 @@ function cleanupResources() {
 
     // フラグのリセット
     isWheelEventAttached = false
+    isInitialized = false
 }
 
 function attachWheelEventForAutoScroll() {
@@ -279,9 +369,6 @@ function insertSettingPanel(targetNode) {
     commentTextSlider.addEventListener('wheel', function (event) {
         handleMouseWheel(event, commentTextSlider, commentTextSizeLabel, 'commentTextFontSize')
     })
-
-    // ボタンは別途呼び出されるため、ここでは呼ばない
-    watchFullscreenChange() // フルスクリーン時にボタン非表示
 }
 
 /**
@@ -324,6 +411,9 @@ function insertToggleButton() {
 
         // addon-controller内の最後にボタンを挿入
         addonController.appendChild(optionButton)
+        
+        // フルスクリーン監視を開始
+        watchFullscreenChange()
     } catch (error) {
         // console.warn('設定ボタンの挿入中にエラーが発生しました:', error)
     }
@@ -350,74 +440,6 @@ function processNewComments(newTableRows) {
             }
         }
     })
-}
-
-/**
- * 要素の挿入を監視
- */
-function checkElementInsert(targetNode) {
-    // 既存のObserverがある場合は切断
-    if (commentInsertObserver) {
-        commentInsertObserver.disconnect()
-    }
-
-    // MutationObserverを作成
-    commentInsertObserver = new MutationObserver(async function (mutations) {
-        let hasNewComments = false
-        let newTableRows = []
-
-        mutations.forEach(function (mutation) {
-            // 追加された要素を取得する
-            const newNodes = mutation.addedNodes
-            const targets = Array.from(newNodes).reduce((accumulator, node) => {
-                if (node.nodeType === Node.ELEMENT_NODE) {
-                    accumulator.push(node)
-                }
-                return accumulator
-            }, [])
-
-            targets.forEach(target => {
-                if (target.classList.contains('contents-tab-panel')) {
-                    attachWheelEventForAutoScroll()
-                    // ボタンは一度だけ作成するため、ここでは呼ばない
-                    return
-                }
-
-                if (target.classList.contains('table-row')) {
-                    hasNewComments = true
-                    newTableRows.push(target)
-                }
-
-                // 子要素の中にtable-rowがあるかチェック
-                const childRows = target.querySelectorAll('.table-row')
-                if (childRows.length > 0) {
-                    hasNewComments = true
-                    newTableRows.push(...Array.from(childRows))
-                }
-            })
-        })
-
-        if (hasNewComments) {
-            // 新しいコメントの処理
-            setTimeout(() => {
-                processNewComments(newTableRows)
-                
-                // 自動スクロール処理
-                if (newTableRows.length > 0 && !isWheelActive) {
-                    const tableBody = newTableRows[0]?.parentElement?.parentElement
-                    if (tableBody) {
-                        const lastRow = newTableRows[newTableRows.length - 1]
-                        if (lastRow) {
-                            scrollToPosition(tableBody, lastRow.offsetTop - tableBody.offsetTop)
-                        }
-                    }
-                }
-            }, 100)
-        }
-    })
-
-    // MutationObserverを開始
-    commentInsertObserver.observe(targetNode, { childList: true, subtree: true })
 }
 
 /**
@@ -493,8 +515,9 @@ function createCommentStyles() {
 }
 
 // スクロール
-function scrollToPosition(tableBody, position = 'bottom') {
+function scrollToPosition(position = 'bottom') {
     try {
+        const tableBody = document.querySelector('[class*="_body_"]')
         if (!tableBody) {
             // console.warn('スクロール対象の要素が見つかりません')
             return
@@ -544,74 +567,6 @@ function isScrollAtBottom() {
     }
 }
 
-function addClickEvent_indicatorButton() {
-    try {
-        const playerSection = document.querySelector('[class*="_player-section_"]')
-        if (!playerSection) {
-            // console.warn('player-section要素が見つかりません')
-            return
-        }
-
-        // 既存のObserverがある場合は切断
-        if (indicatorButtonObserver) {
-            indicatorButtonObserver.disconnect()
-        }
-
-        // MutationObserverで`indicator`の追加を監視
-        indicatorButtonObserver = new MutationObserver(() => {
-            try {
-                const indicator = playerSection.querySelector('[class*="_indicator_"]')
-                if (indicator && !indicator.dataset.myEventAdded) {
-                    // イベントが未登録の場合のみ追加
-                    indicator.addEventListener('click', handleIndicatorClick)
-                    indicator.dataset.myEventAdded = 'true' // フラグを設定して再登録を防止
-                }
-            } catch (error) {
-                // console.warn('インジケータ監視中にエラーが発生しました:', error)
-            }
-        })
-
-        // `playerSection` 内のDOM変更を監視
-        indicatorButtonObserver.observe(playerSection, {
-            childList: true,
-            subtree: true,
-        })
-
-        // イベントハンドラー関数
-        function handleIndicatorClick(e) {
-            try {
-                const emotionButton = document.querySelector('[class*="_emotion-button_"]')
-                const lockItemArea = document.querySelector('[class*="_lock-item-area_"]')
-                const nageadButton = lockItemArea?.querySelector('[data-content-type="nagead"]')
-
-                if (emotionButton) {
-                    emotionButton.click()
-                    setTimeout(() => {
-                        try {
-                            emotionButton.click()
-                        } catch (error) {
-                            // console.warn('emotionButtonクリック中にエラーが発生しました:', error)
-                        }
-                    }, 100)
-                } else if (nageadButton) {
-                    nageadButton.click()
-                    setTimeout(() => {
-                        try {
-                            nageadButton.click()
-                        } catch (error) {
-                            // console.warn('nageadButtonクリック中にエラーが発生しました:', error)
-                        }
-                    }, 100)
-                }
-            } catch (error) {
-                // console.warn('インジケータクリック処理中にエラーが発生しました:', error)
-            }
-        }
-    } catch (error) {
-        // console.warn('インジケータボタンイベント設定中にエラーが発生しました:', error)
-    }
-}
-
 // 弾幕判定関数
 function isDanmakuComment(comment) {
     try {
@@ -646,7 +601,10 @@ function watchFullscreenChange() {
         const optionButton = document.getElementsByClassName('option-button')[0]
 
         if (!optionButton) {
-            // console.warn('option-button要素が見つかりません')
+            // option-button要素が見つからない場合は、少し遅延して再試行
+            setTimeout(() => {
+                watchFullscreenChange()
+            }, 1000)
             return
         }
 
