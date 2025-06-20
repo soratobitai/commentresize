@@ -16,9 +16,11 @@ let updateStylesTimeout = null // スタイル更新の遅延用タイマー
 let wheelEventTimeout = null // ホイールイベント用タイマー
 let commentInsertObserver = null // コメント挿入監視用Observer
 let fullscreenObserver = null // フルスクリーン監視用Observer
+let tableBodyHeightObserver = null // tableBodyの高さ監視用Observer
 let isWheelEventAttached = false // ホイールイベント重複防止フラグ
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
+let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -72,6 +74,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 removeNoBorderStyle()
                 // 有効化後に自動スクロール
                 scrollToPosition()
+                // tableBodyの高さ監視を開始
+                startTableBodyHeightMonitoring()
             }, 500)
         }
     }
@@ -213,6 +217,9 @@ function initializeApp(targetNode) {
 
     // ホイールイベントを追加
     attachWheelEventForAutoScroll()
+    
+    // tableBodyの高さ監視を開始
+    startTableBodyHeightMonitoring()
 }
 
 /**
@@ -273,10 +280,22 @@ function cleanupResources() {
         fullscreenObserver.disconnect()
         fullscreenObserver = null
     }
+    if (tableBodyHeightObserver) {
+        tableBodyHeightObserver.disconnect()
+        tableBodyHeightObserver = null
+    }
 
     // フラグのリセット
     isWheelEventAttached = false
     isInitialized = false
+
+    // フルスクリーンイベントリスナーのクリーンアップ
+    if (fullscreenCheckFunction) {
+        document.removeEventListener('fullscreenchange', fullscreenCheckFunction)
+        document.removeEventListener('webkitfullscreenchange', fullscreenCheckFunction)
+        document.removeEventListener('mozfullscreenchange', fullscreenCheckFunction)
+        fullscreenCheckFunction = null
+    }
 }
 
 function attachWheelEventForAutoScroll() {
@@ -891,29 +910,61 @@ function watchFullscreenChange() {
             fullscreenObserver.disconnect()
         }
 
-        fullscreenObserver = new ResizeObserver(entries => {
+        // フルスクリーン判定関数
+        const checkFullscreen = () => {
             try {
-                for (const entry of entries) {
-                    const elementWidth = entry.contentRect.width
-                    const windowWidth = window.innerWidth
+                let isFullscreen = false
 
-                    if (elementWidth === windowWidth) {
-                        optionButton.style.display = 'none'
-                    } else {
-                        optionButton.style.display = ''
-                    }
+                // 方法1: document.fullscreenElementをチェック（最も確実）
+                if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) {
+                    isFullscreen = true
+                }
+
+                // 方法2: プレイヤーエリアのサイズをチェック
+                const playerElements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
+                if (playerElements.length > 0) {
+                    playerElements.forEach(el => {
+                        const elementWidth = el.offsetWidth || el.clientWidth
+                        const windowWidth = window.innerWidth
+                        
+                        // 要素の幅がウィンドウ幅とほぼ同じ場合をフルスクリーンと判定
+                        if (elementWidth > 0 && windowWidth > 0 && Math.abs(elementWidth - windowWidth) < 5) {
+                            isFullscreen = true
+                        }
+                    })
+                }
+
+                // ボタンの表示/非表示を切り替え
+                if (isFullscreen) {
+                    optionButton.style.display = 'none'
+                } else {
+                    optionButton.style.display = ''
                 }
             } catch (error) {
-                // console.warn('フルスクリーン監視中にエラーが発生しました:', error)
+                // エラー時は通常表示としてボタンを表示
+                optionButton.style.display = ''
             }
+        }
+
+        // グローバル変数に保存（クリーンアップ用）
+        fullscreenCheckFunction = checkFullscreen
+
+        // ResizeObserverでサイズ変化を監視
+        fullscreenObserver = new ResizeObserver(entries => {
+            checkFullscreen()
         })
 
+        // 監視対象の要素を取得
         const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
         if (elements.length === 0) {
-            // console.warn('フルスクリーン監視対象の要素が見つかりません')
+            // 監視対象が見つからない場合は、少し遅延して再試行
+            setTimeout(() => {
+                watchFullscreenChange()
+            }, 2000)
             return
         }
 
+        // 要素を監視
         elements.forEach(el => {
             try {
                 fullscreenObserver.observe(el)
@@ -921,6 +972,15 @@ function watchFullscreenChange() {
                 // console.warn('要素の監視開始中にエラーが発生しました:', error)
             }
         })
+
+        // フルスクリーンイベントリスナーを追加
+        document.addEventListener('fullscreenchange', fullscreenCheckFunction)
+        document.addEventListener('webkitfullscreenchange', fullscreenCheckFunction)
+        document.addEventListener('mozfullscreenchange', fullscreenCheckFunction)
+
+        // 初期状態をチェック
+        setTimeout(checkFullscreen, 100)
+
     } catch (error) {
         // console.warn('フルスクリーン監視設定中にエラーが発生しました:', error)
     }
@@ -957,4 +1017,48 @@ function addNoBorderStyle() {
 function removeNoBorderStyle() {
     const style = document.getElementById('no-border-style')
     if (style) style.remove()
+}
+
+/**
+ * tableBodyの高さ変化を監視
+ */
+function startTableBodyHeightMonitoring() {
+    try {
+        const tableBody = document.querySelector('[class*="_body_"]')
+        if (!tableBody) {
+            console.warn('tableBody要素が見つかりません')
+            return
+        }
+
+        // 既存のObserverがある場合は切断
+        if (tableBodyHeightObserver) {
+            tableBodyHeightObserver.disconnect()
+        }
+
+        // 初期高さを記録
+        let previousHeight = tableBody.offsetHeight
+
+        tableBodyHeightObserver = new ResizeObserver(entries => {
+            try {
+                for (const entry of entries) {
+                    const currentHeight = entry.contentRect.height
+                    
+                    // 高さが変わった場合
+                    if (currentHeight !== previousHeight) {
+                        // 自動スクロールを実行
+                        setTimeout(() => {
+                            scrollToPosition()
+                        }, 100)
+                        previousHeight = currentHeight
+                    }
+                }
+            } catch (error) {
+                console.warn('tableBody高さ監視中にエラーが発生しました:', error)
+            }
+        })
+
+        tableBodyHeightObserver.observe(tableBody)
+    } catch (error) {
+        console.warn('tableBody高さ監視設定中にエラーが発生しました:', error)
+    }
 }
