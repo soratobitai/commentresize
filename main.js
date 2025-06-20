@@ -192,7 +192,7 @@ function scheduleInitialization(targetNode) {
         if (!isInitialized) {
             initializeApp(targetNode)
             isInitialized = true
-            
+
             // 初期化後にスクロール位置を調整
             setTimeout(() => {
                 scrollToPosition()
@@ -331,69 +331,84 @@ function attachWheelEventForAutoScroll() {
  */
 function insertSettingPanel(targetNode) {
 
-    const contentsArea = targetNode.querySelector('[class*="_contents-area_"]')
+    // addon-controller要素を取得
+    const addonController = document.querySelector('.addon-controller')
+    if (!addonController) {
+        // console.warn('addon-controller要素が見つかりません')
+        return
+    }
 
     const sliderContainer = document.createElement('div')
     sliderContainer.classList.add('setting-container') // 設定画面の表示/非表示用にクラスを追加
     sliderContainer.style.display = 'none' // 初期状態
+    // 指定されたスタイルを適用
+    sliderContainer.style.zIndex = '1000'
+    sliderContainer.style.position = 'absolute'
+    sliderContainer.style.bottom = 'calc(100% + 20px)'
+    sliderContainer.style.right = '0'
 
     sliderContainer.innerHTML = `
         <div style="
-            max-width: 350px;
-            margin: 0 auto;
-            background: linear-gradient(135deg, #f8fafc 0%, #e0e7ff 100%);
-            box-shadow: 0 8px 32px rgba(60,60,120,0.12), 0 1.5px 4px rgba(60,60,120,0.08);
+            width: 300px;
+            max-width: 300px;
+            margin: 0;
+            background: rgba(0, 0, 0, 0.7);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.4), 0 4px 12px rgba(0,0,0,0.3);
             padding: 28px 24px 20px 24px;
-            border: 1.5px solid #d1d5db;
+            border: 1px solid #404040;
+            border-radius: 12px;
             font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+            backdrop-filter: blur(10px);
         ">
             <!-- 機能拡張の有効/無効トグル -->
             <div style="margin-bottom: 28px;">
                 <div style="display: flex; align-items: center; justify-content: space-between;">
-                    <span style="color: #4f46e5; font-weight: bold; font-size: 18px; letter-spacing: 0.03em;">機能拡張</span>
-                    <div class="toggle-switch" style="position: relative; width: 44px; height: 22px; background: ${isExtensionEnabled ? '#4CAF50' : '#cbd5e1'}; border-radius: 11px; cursor: pointer; transition: background 0.3s; box-shadow: 0 2px 8px rgba(76,175,80,0.08);">
-                        <div class="toggle-slider" style="position: absolute; top: 2px; left: ${isExtensionEnabled ? '23px' : '2px'}; width: 18px; height: 18px; background: white; border-radius: 50%; transition: left 0.3s; box-shadow: 0 2px 8px rgba(60,60,120,0.10);"></div>
+                    <span style="color: #ffffff; font-weight: 600; font-size: 18px; letter-spacing: 0.03em; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">コメントサイズ調整</span>
+                    <div class="toggle-switch" style="position: relative; width: 48px; height: 24px; background: ${isExtensionEnabled ? '#3b82f6' : '#404040'}; border-radius: 12px; cursor: pointer; transition: all 0.3s ease; box-shadow: inset 0 2px 4px rgba(0,0,0,0.2); border: 1px solid ${isExtensionEnabled ? '#3b82f6' : '#555555'};">
+                        <div class="toggle-slider" style="position: absolute; top: 2px; left: ${isExtensionEnabled ? '24px' : '2px'}; width: 18px; height: 18px; background: linear-gradient(135deg, #ffffff 0%, #f0f0f0 100%); border-radius: 50%; transition: all 0.3s ease; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>
                     </div>
                 </div>
             </div>
 
             <!-- 設定項目カード -->
             <div style="
-                opacity: ${isExtensionEnabled ? '1' : '0.5'};
+                opacity: ${isExtensionEnabled ? '1' : '0.4'};
                 pointer-events: ${isExtensionEnabled ? 'auto' : 'none'};
-                transition: opacity 0.3s;
-                background: #fff;
-                border-radius: 12px;
-                box-shadow: 0 2px 8px rgba(60,60,120,0.06);
-                padding: 18px 16px 10px 16px;
+                transition: all 0.3s ease;
+                background: linear-gradient(135deg, #2a2a2a 0%, #333333 100%);
+                border-radius: 6px;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.1);
+                padding: 20px 18px 14px 18px;
                 margin-bottom: 10px;
-                border: 1px solid #e0e7ff;
+                border: 1px solid #404040;
             ">
-                <div style="margin-bottom: 18px;">
-                    <label style="font-size: 15px; color: #374151; font-weight: 500;">番号サイズ
-                        <span id="comment-number-size" style="margin-left: 8px; color: #6366f1; font-size: 15px;">${commentNumberFontSize}</span>
+                <div style="margin-bottom: 20px;">
+                    <label style="font-size: 15px; color: #e0e0e0; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">番号サイズ
+                        <span id="comment-number-size" style="margin-left: 8px; color: #ffffff; font-size: 15px; font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,0.5);">${commentNumberFontSize}</span>
                     </label>
                     <input id="commentNumberSlider" type="range" min="50" max="300" value="${parseInt(commentNumberFontSize) || 100}"
-                        style="width: 100%; margin-top: 6px; accent-color: #6366f1; height: 4px; border-radius: 2px;">
+                        style="width: 100%; margin-top: 8px; accent-color: #3b82f6; height: 6px; border-radius: 3px; background: #404040; outline: none;">
                 </div>
-                <div style="margin-bottom: 18px;">
-                    <label style="font-size: 15px; color: #374151; font-weight: 500;">コメントサイズ
-                        <span id="comment-text-size" style="margin-left: 8px; color: #6366f1; font-size: 15px;">${commentTextFontSize}</span>
+                <div style="margin-bottom: 20px;">
+                    <label style="font-size: 15px; color: #e0e0e0; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">コメントサイズ
+                        <span id="comment-text-size" style="margin-left: 8px; color: #ffffff; font-size: 15px; font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,0.5);">${commentTextFontSize}</span>
                     </label>
                     <input id="commentTextSlider" type="range" min="50" max="300" value="${parseInt(commentTextFontSize) || 100}"
-                        style="width: 100%; margin-top: 6px; accent-color: #6366f1; height: 4px; border-radius: 2px;">
+                        style="width: 100%; margin-top: 8px; accent-color: #3b82f6; height: 6px; border-radius: 3px; background: #404040; outline: none;">
                 </div>
-                <div style="margin-top: 10px; display: flex; align-items: center;">
-                    <label style="font-size: 15px; color: #374151; font-weight: 500; display: flex; align-items: center; cursor: pointer;">
+                <div style="margin-top: 12px; display: flex; align-items: center;">
+                    <label style="font-size: 15px; color: #e0e0e0; font-weight: 500; display: flex; align-items: center; cursor: pointer; text-shadow: 0 1px 2px rgba(0,0,0,0.3);">
                         <input type="checkbox" id="isShowFullCommentCheckbox" ${isShowFullComment ? 'checked' : ''}
-                            style="width: 18px; height: 18px; accent-color: #6366f1; margin-right: 8px;">
+                            style="width: 18px; height: 18px; accent-color: #3b82f6; margin-right: 10px; transform: scale(1.1);">
                         長いコメントを折り返す
                     </label>
                 </div>
             </div>
         </div>
     `
-    contentsArea.parentNode.insertBefore(sliderContainer, contentsArea.nextSibling)
+    
+    // addon-controller内の最後に挿入（Aaボタンの次に配置）
+    addonController.appendChild(sliderContainer)
 
     // 設定画面のイベントリスナーを追加
     const commentNumberSlider = document.getElementById('commentNumberSlider')
@@ -430,6 +445,11 @@ function insertSettingPanel(targetNode) {
             updateCommentStyles(true)
             attachWheelEventForAutoScroll()
             removeNoBorderStyle() // ボーダー消去スタイルを削除
+            
+            // 機能有効化後に自動スクロールを実行
+            setTimeout(() => {
+                scrollToPosition()
+            }, 300)
         } else {
             removeCommentStyles() // スタイルを削除
             document.documentElement.style.removeProperty('--comment-number-size')
@@ -456,6 +476,11 @@ function insertSettingPanel(targetNode) {
         commentNumberSizeLabel.textContent = commentNumberFontSize
         saveSettings({ commentNumberFontSize }) // 遅延保存
         updateCommentStyles() // 遅延更新
+        
+        // サイズ変更後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     })
 
     commentTextSlider.addEventListener('input', function () {
@@ -465,6 +490,11 @@ function insertSettingPanel(targetNode) {
         commentTextSizeLabel.textContent = commentTextFontSize
         saveSettings({ commentTextFontSize }) // 遅延保存
         updateCommentStyles() // 遅延更新
+        
+        // サイズ変更後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     })
 
     // ダブルクリックでデフォルトサイズにリセット
@@ -476,6 +506,11 @@ function insertSettingPanel(targetNode) {
         commentNumberSlider.value = parseInt(defaultCommentNumberFontSize) || 100
         saveSettings({ commentNumberFontSize }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
+        
+        // リセット後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     })
 
     commentTextSlider.addEventListener('dblclick', function () {
@@ -486,6 +521,11 @@ function insertSettingPanel(targetNode) {
         commentTextSlider.value = parseInt(defaultCommentTextFontSize) || 100
         saveSettings({ commentTextFontSize }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
+        
+        // リセット後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     })
 
     // ホイールイベントを追加
@@ -507,6 +547,11 @@ function insertSettingPanel(targetNode) {
             commentTextFontSize = newValue + '%' // 更新されたサイズをセット
         }
         updateCommentStyles() // 遅延更新
+        
+        // ホイール変更後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     }
 
     // コメント番号ホイールイベント
@@ -538,6 +583,8 @@ function insertToggleButton() {
 
         const optionButton = document.createElement('button')
         optionButton.textContent = 'Aa'
+        optionButton.setAttribute('type', 'button')
+        optionButton.setAttribute('aria-label', 'コメントサイズ調整')
         optionButton.style.backgroundColor = 'initial'
         optionButton.style.color = '#fff'
         optionButton.style.border = 'none'
@@ -598,7 +645,7 @@ function handleOutsideClick(event) {
 function processNewComments(newTableRows) {
     // 機能拡張が無効の場合は処理をスキップ
     if (!isExtensionEnabled) return
-    
+
     if (!newTableRows || newTableRows.length === 0) return
 
     // 新しいコメントのみを処理
@@ -607,7 +654,7 @@ function processNewComments(newTableRows) {
         if (commentText) {
             const comment = commentText.textContent || ''
             const isDanmaku = isDanmakuComment(comment)
-            
+
             // 弾幕クラスの付与
             if (isDanmaku) {
                 commentText.classList.add('danmaku-comment')
@@ -694,6 +741,42 @@ function createCommentStyles() {
         
         .danmaku-comment {
             white-space: nowrap !important;
+        }
+
+        /* ツールチップ機能 */
+        .option-button[aria-label]:before {
+            content: attr(aria-label);
+        }
+
+        .option-button {
+            position: relative;
+        }
+
+        .option-button:before {
+            letter-spacing: initial;
+            box-sizing: border-box;
+            text-align: center;
+            white-space: nowrap;
+            color: #fff;
+            background-color: #252525;
+            pointer-events: none;
+            z-index: 10000;
+            opacity: 0;
+            border-radius: 2px;
+            padding: 6px 8px;
+            font-size: 12px;
+            line-height: 1;
+            transition: opacity .12s;
+            display: block;
+            position: absolute;
+            bottom: 100%;
+            left: -20px;
+            transform: translateX(-50%);
+            margin: 0;
+        }
+
+        .option-button:hover:before {
+            opacity: 1;
         }
     `
     document.head.appendChild(style)
