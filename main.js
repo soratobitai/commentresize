@@ -43,17 +43,9 @@ document.addEventListener('DOMContentLoaded', () => {
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
         isExtensionEnabled = (typeof result.isExtensionEnabled === 'boolean') ? result.isExtensionEnabled : defaultIsExtensionEnabled
 
-        // 設定画面と設定ボタンは常に表示
-        insertSettingPanel(targetNode)
-        setTimeout(() => {
-            insertToggleButton()
-        }, 1000)
-
-        // contents-tab-panelの監視を開始
-        startContentsTabPanelMonitoring(targetNode)
-        
         // コメントの挿入を監視してから初期化を開始
         startCommentMonitoring(targetNode)
+        
     })
 })
 
@@ -316,7 +308,7 @@ function scheduleInitialization(targetNode) {
         clearTimeout(initializationTimeout)
     }
 
-    // 1秒後に初期化を実行
+    // ◯秒後に初期化を実行
     initializationTimeout = setTimeout(() => {
         if (!isInitialized) {
             initializeApp(targetNode)
@@ -348,6 +340,15 @@ function initializeApp(targetNode) {
     
     // tableBodyの高さ監視を開始
     startTableBodyHeightMonitoring()
+
+    // 設定画面を表示
+    insertSettingPanel(targetNode)
+
+    // 設定ボタンを表示
+    insertToggleButton()
+
+    // contents-tab-panelの監視を開始
+    startContentsTabPanelMonitoring(targetNode)
 }
 
 /**
@@ -1154,7 +1155,7 @@ function startTableBodyHeightMonitoring() {
     try {
         const tableBody = document.querySelector('[class*="_body_"]')
         if (!tableBody) {
-            console.warn('tableBody要素が見つかりません')
+            // console.warn('tableBody要素が見つかりません')
             return
         }
 
@@ -1181,12 +1182,12 @@ function startTableBodyHeightMonitoring() {
                     }
                 }
             } catch (error) {
-                console.warn('tableBody高さ監視中にエラーが発生しました:', error)
+                // console.warn('tableBody高さ監視中にエラーが発生しました:', error)
             }
         })
 
         tableBodyHeightObserver.observe(tableBody)
     } catch (error) {
-        console.warn('tableBody高さ監視設定中にエラーが発生しました:', error)
+        // console.warn('tableBody高さ監視設定中にエラーが発生しました:', error)
     }
 }
