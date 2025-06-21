@@ -7,7 +7,7 @@ const defaultIsExtensionEnabled = true // 機能拡張の有効/無効のデフ�
 let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
-let isExtensionEnabled = defaultIsExtensionEnabled // 機能拡張の有効/無効フラグ
+let isExtensionEnabled = defaultIsExtensionEnabled // 機能拡張の有効/無効フラグ（ユーザー設定）
 let isWheelActive = false // スクロール中かどうかのフラグ
 let saveTimeout = null // 保存の遅延用タイマー
 let updateStylesTimeout = null // スタイル更新の遅延用タイマー
@@ -17,10 +17,12 @@ let wheelEventTimeout = null // ホイールイベント用タイマー
 let commentInsertObserver = null // コメント挿入監視用Observer
 let fullscreenObserver = null // フルスクリーン監視用Observer
 let tableBodyHeightObserver = null // tableBodyの高さ監視用Observer
+let contentsTabPanelObserver = null // contents-tab-panel監視用Observer
 let isWheelEventAttached = false // ホイールイベント重複防止フラグ
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
+let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -47,62 +49,185 @@ document.addEventListener('DOMContentLoaded', () => {
             insertToggleButton()
         }, 1000)
 
+        // contents-tab-panelの監視を開始
+        startContentsTabPanelMonitoring(targetNode)
+        
         // コメントの挿入を監視してから初期化を開始
         startCommentMonitoring(targetNode)
     })
-
-    // --- ここからエモーションボタン監視追加 ---
-    function handleEmotionButtonClick() {
-        const hasTabPanel = document.querySelector('.contents-tab-panel') !== null
-        if (!hasTabPanel) {
-            // 無ければ無効化
-            if (!isExtensionEnabled) return
-            isExtensionEnabled = false
-            removeCommentStyles()
-            document.documentElement.style.removeProperty('--comment-number-size')
-            document.documentElement.style.removeProperty('--comment-text-size')
-            document.documentElement.style.removeProperty('--comment-wrap-mode')
-            addNoBorderStyle()
-        } else {
-            // あれば◯秒後に有効化
-            setTimeout(() => {
-                if (isExtensionEnabled) return
-                isExtensionEnabled = true
-                createCommentStyles()
-                updateCommentStyles(true)
-                attachWheelEventForAutoScroll()
-                removeNoBorderStyle()
-                // 有効化後に自動スクロール
-                scrollToPosition()
-                // tableBodyの高さ監視を開始
-                startTableBodyHeightMonitoring()
-            }, 500)
-        }
-    }
-
-    // エモーションボタンを監視してイベントを付与
-    function observeEmotionButton() {
-        const tryAttach = () => {
-            const btn = document.querySelector('[class*="_emotion-button_"]')
-            if (btn && !btn.__extensionEmotionListenerAdded) {
-                btn.addEventListener('click', handleEmotionButtonClick)
-                btn.__extensionEmotionListenerAdded = true
-            }
-            // ギフトボタンにも同じ動作を設定
-            const giftBtn = document.querySelector('button.___item___qkXEW[data-content-type="nagead"]')
-            if (giftBtn && !giftBtn.__extensionGiftListenerAdded) {
-                giftBtn.addEventListener('click', handleEmotionButtonClick)
-                giftBtn.__extensionGiftListenerAdded = true
-            }
-        }
-        // 初回即時実行
-        tryAttach()
-        // 以降は定期的に監視（MutationObserverでも可だが簡易にIntervalで）
-        setInterval(tryAttach, 1000)
-    }
-    observeEmotionButton()
-    // --- ここまでエモーションボタン監視追加 ---
 })
+
+/**
+ * contents-tab-panelの存在を常に監視
+ */
+function startContentsTabPanelMonitoring(targetNode) {
+    // 既存のObserverがある場合は切断
+    if (contentsTabPanelObserver) {
+        contentsTabPanelObserver.disconnect()
+    }
+
+    // MutationObserverを作成
+    contentsTabPanelObserver = new MutationObserver((mutations) => {
+        let shouldCheck = false
+        
+        mutations.forEach((mutation) => {
+            if (mutation.type === 'childList') {
+                // 削除された要素をチェック
+                mutation.removedNodes.forEach((node) => {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.classList.contains('contents-tab-panel') || 
+                            node.querySelector('.contents-tab-panel')) {
+                            shouldCheck = true
+                        }
+                    }
+                })
+                
+                // 追加された要素をチェック
+                mutation.addedNodes.forEach((node) => {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.classList.contains('contents-tab-panel') || 
+                            node.querySelector('.contents-tab-panel')) {
+                            shouldCheck = true
+                        }
+                    }
+                })
+            }
+        })
+        
+        // 変更があった場合のみ状態を更新
+        if (shouldCheck) {
+            updateExtensionStateBasedOnTabPanel()
+        }
+    })
+
+    // MutationObserverを開始
+    contentsTabPanelObserver.observe(targetNode, {
+        childList: true,  // 子要素の追加/削除を監視
+        subtree: true     // 子孫要素も監視
+    })
+
+    // 初期状態をチェック
+    updateExtensionStateBasedOnTabPanel()
+}
+
+/**
+ * contents-tab-panelの存在に基づいて機能拡張の状態を更新
+ */
+function updateExtensionStateBasedOnTabPanel() {
+    const hasTabPanel = document.querySelector('.contents-tab-panel') !== null
+    
+    if (hasTabPanel !== isTabPanelAvailable) {
+        isTabPanelAvailable = hasTabPanel
+        
+        // ユーザーが機能拡張を有効にしている場合のみ、パネルの存在に応じて動作を制御
+        if (isExtensionEnabled) {
+            if (hasTabPanel) {
+                // パネルが存在する場合：機能を有効化
+                enableExtensionTemporarily()
+            } else {
+                // パネルが存在しない場合：機能を一時的に無効化
+                disableExtensionTemporarily()
+            }
+        }
+    }
+}
+
+/**
+ * 機能拡張を一時的に無効化（設定には影響しない）
+ */
+function disableExtensionTemporarily() {
+    removeCommentStyles()
+    document.documentElement.style.removeProperty('--comment-number-size')
+    document.documentElement.style.removeProperty('--comment-text-size')
+    document.documentElement.style.removeProperty('--comment-wrap-mode')
+    addNoBorderStyle()
+}
+
+/**
+ * 機能拡張を一時的に有効化（設定には影響しない）
+ */
+function enableExtensionTemporarily() {
+    createCommentStyles()
+    updateCommentStyles(true)
+    attachWheelEventForAutoScroll()
+    removeNoBorderStyle()
+    
+    // 既存のコメントに弾幕判定を適用
+    processComments()
+    
+    // 有効化後に自動スクロール
+    scrollToPosition()
+    
+    // tableBodyの高さ監視を開始
+    startTableBodyHeightMonitoring()
+}
+
+/**
+ * 機能拡張を無効化（ユーザー設定を変更）
+ */
+function disableExtension() {
+    if (!isExtensionEnabled) return
+    
+    isExtensionEnabled = false
+    disableExtensionTemporarily()
+    
+    // 設定を保存
+    saveSettings({ isExtensionEnabled }, true)
+    
+    // 設定パネルを更新
+    updateSettingPanelState()
+}
+
+/**
+ * 機能拡張を有効化（ユーザー設定を変更）
+ */
+function enableExtension() {
+    if (isExtensionEnabled) return
+    
+    isExtensionEnabled = true
+    
+    // contents-tab-panelが存在する場合のみ実際に機能を有効化
+    if (isTabPanelAvailable) {
+        enableExtensionTemporarily()
+    }
+    
+    // 設定を保存
+    saveSettings({ isExtensionEnabled }, true)
+    
+    // 設定パネルを更新
+    updateSettingPanelState()
+}
+
+/**
+ * 設定パネルの状態を更新
+ */
+function updateSettingPanelState() {
+    const toggleSwitch = document.querySelector('.toggle-switch')
+    const toggleSlider = document.querySelector('.toggle-slider')
+    const settingCard = document.querySelector('.setting-container > div > div:nth-child(2)')
+    
+    if (toggleSwitch && toggleSlider) {
+        // トグルスイッチの状態を更新
+        toggleSwitch.style.background = isExtensionEnabled ? '#3b82f6' : '#404040'
+        toggleSwitch.style.borderColor = isExtensionEnabled ? '#3b82f6' : '#555555'
+        toggleSlider.style.left = isExtensionEnabled ? '24px' : '2px'
+    }
+    
+    if (settingCard) {
+        // 設定項目カードの状態を更新
+        settingCard.style.opacity = isExtensionEnabled ? '1' : '0.4'
+        settingCard.style.pointerEvents = isExtensionEnabled ? 'auto' : 'none'
+    }
+    
+    // 各コントロールのdisabled状態を更新
+    const commentNumberSlider = document.getElementById('commentNumberSlider')
+    const commentTextSlider = document.getElementById('commentTextSlider')
+    const isShowFullCommentCheckbox = document.getElementById('isShowFullCommentCheckbox')
+    
+    if (commentNumberSlider) commentNumberSlider.disabled = !isExtensionEnabled
+    if (commentTextSlider) commentTextSlider.disabled = !isExtensionEnabled
+    if (isShowFullCommentCheckbox) isShowFullCommentCheckbox.disabled = !isExtensionEnabled
+}
 
 /**
  * コメント監視を開始し、最初のコメントが挿入されてから初期化を実行
@@ -163,7 +288,7 @@ function startCommentMonitoring(targetNode) {
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
 
-            processNewComments(newTableRows)
+            processComments(newTableRows)
 
             // 自動スクロール処理
             if (newTableRows.length > 0 && !isWheelActive && isScrollAtBottom()) {
@@ -214,6 +339,9 @@ function initializeApp(targetNode) {
 
     // 初期スタイルを適用
     updateCommentStyles(true) // 即座に更新
+
+    // 既存のコメントに弾幕判定を適用
+    processComments()
 
     // ホイールイベントを追加
     attachWheelEventForAutoScroll()
@@ -284,6 +412,10 @@ function cleanupResources() {
         tableBodyHeightObserver.disconnect()
         tableBodyHeightObserver = null
     }
+    if (contentsTabPanelObserver) {
+        contentsTabPanelObserver.disconnect()
+        contentsTabPanelObserver = null
+    }
 
     // フラグのリセット
     isWheelEventAttached = false
@@ -300,8 +432,8 @@ function cleanupResources() {
 
 function attachWheelEventForAutoScroll() {
     try {
-        // 機能拡張が無効の場合はスキップ
-        if (!isExtensionEnabled) return
+        // 機能拡張が無効またはパネルが存在しない場合はスキップ
+        if (!isExtensionEnabled || !isTabPanelAvailable) return
 
         // 既にイベントが追加されている場合はスキップ
         if (isWheelEventAttached) return
@@ -315,8 +447,8 @@ function attachWheelEventForAutoScroll() {
 
         tableBody.addEventListener('wheel', () => {
             try {
-                // 機能拡張が無効の場合は処理をスキップ
-                if (!isExtensionEnabled) return
+                // 機能拡張が無効またはパネルが存在しない場合は処理をスキップ
+                if (!isExtensionEnabled || !isTabPanelAvailable) return
 
                 isWheelActive = true // ホイール操作中はtrueに設定
 
@@ -444,7 +576,12 @@ function insertSettingPanel(targetNode) {
     // 機能拡張の有効/無効トグルイベント
     const toggleSwitch = sliderContainer.querySelector('.toggle-switch')
     toggleSwitch.addEventListener('click', function() {
-        isExtensionEnabled = !isExtensionEnabled
+        // 手動でトグル
+        if (isExtensionEnabled) {
+            disableExtension()
+        } else {
+            enableExtension()
+        }
         
         // 設定パネルの表示状態を記憶
         const oldPanel = document.querySelector('.setting-container')
@@ -454,28 +591,6 @@ function insertSettingPanel(targetNode) {
         // 新しいパネルに表示状態を復元
         const newPanel = document.querySelector('.setting-container')
         if (newPanel && prevDisplay) newPanel.style.display = prevDisplay
-
-        // 設定を保存
-        saveSettings({ isExtensionEnabled }, true)
-        
-        // 機能拡張の状態に応じて処理を実行
-        if (isExtensionEnabled) {
-            createCommentStyles() // スタイルを再作成
-            updateCommentStyles(true)
-            attachWheelEventForAutoScroll()
-            removeNoBorderStyle() // ボーダー消去スタイルを削除
-            
-            // 機能有効化後に自動スクロールを実行
-            setTimeout(() => {
-                scrollToPosition()
-            }, 300)
-        } else {
-            removeCommentStyles() // スタイルを削除
-            document.documentElement.style.removeProperty('--comment-number-size')
-            document.documentElement.style.removeProperty('--comment-text-size')
-            document.documentElement.style.removeProperty('--comment-wrap-mode')
-            addNoBorderStyle() // ボーダー消去スタイルを追加
-        }
     })
 
     // チェックボックスの変更イベント
@@ -485,6 +600,11 @@ function insertSettingPanel(targetNode) {
         isShowFullComment = this.checked
         saveSettings({ isShowFullComment }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
+        
+        // 折り返し設定変更後に自動スクロールを実行
+        setTimeout(() => {
+            scrollToPosition()
+        }, 100)
     })
 
     // スライダーのイベントリスナー
@@ -659,37 +779,45 @@ function handleOutsideClick(event) {
 }
 
 /**
- * 新しいコメントの弾幕判定とクラス付与
+ * コメントの弾幕判定とクラス付与（統合版）
+ * @param {NodeList|Array} commentRows - 処理対象のコメント行要素（省略時は既存のすべてのコメント）
  */
-function processNewComments(newTableRows) {
-    // 機能拡張が無効の場合は処理をスキップ
-    if (!isExtensionEnabled) return
+function processComments(commentRows = null) {
+    // 機能拡張が無効またはパネルが存在しない場合は処理をスキップ
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
 
-    if (!newTableRows || newTableRows.length === 0) return
+    try {
+        // 引数が指定されていない場合は既存のすべてのコメント行を取得
+        const rows = commentRows || document.querySelectorAll('.table-row')
+        
+        if (!rows || rows.length === 0) return
 
-    // 新しいコメントのみを処理
-    newTableRows.forEach(row => {
-        const commentText = row.querySelector('.comment-text')
-        if (commentText) {
-            const comment = commentText.textContent || ''
-            const isDanmaku = isDanmakuComment(comment)
+        // 各コメント行に対して弾幕判定を実行
+        rows.forEach(row => {
+            const commentText = row.querySelector('.comment-text')
+            if (commentText) {
+                const comment = commentText.textContent || ''
+                const isDanmaku = isDanmakuComment(comment)
 
-            // 弾幕クラスの付与
-            if (isDanmaku) {
-                commentText.classList.add('danmaku-comment')
-            } else {
-                commentText.classList.remove('danmaku-comment')
+                // 弾幕クラスの付与
+                if (isDanmaku) {
+                    commentText.classList.add('danmaku-comment')
+                } else {
+                    commentText.classList.remove('danmaku-comment')
+                }
             }
-        }
-    })
+        })
+    } catch (error) {
+        // console.warn('コメント処理中にエラーが発生しました:', error)
+    }
 }
 
 /**
  * CSS変数を更新してコメントスタイルを適用（最適化版）
  */
 function updateCommentStyles(immediate = false) {
-    // 機能拡張が無効の場合は処理をスキップ
-    if (!isExtensionEnabled) return
+    // 機能拡張が無効またはパネルが存在しない場合は処理をスキップ
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
 
     if (updateStylesTimeout) {
         clearTimeout(updateStylesTimeout)
@@ -710,8 +838,8 @@ function updateCommentStyles(immediate = false) {
  * 実際のスタイル適用処理
  */
 function applyCommentStyles() {
-    // 機能拡張が無効の場合は処理をスキップ
-    if (!isExtensionEnabled) return
+    // 機能拡張が無効またはパネルが存在しない場合は処理をスキップ
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
 
     // CSS変数のみ更新（DOM操作なし）
     document.documentElement.style.setProperty('--comment-number-size', commentNumberFontSize)
@@ -729,8 +857,8 @@ function createCommentStyles() {
         existingStyle.remove()
     }
 
-    // 機能拡張が無効の場合はスタイルを作成しない
-    if (!isExtensionEnabled) return
+    // 機能拡張が無効またはパネルが存在しない場合はスタイルを作成しない
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
 
     const style = document.createElement('style')
     style.id = 'comment-resize-styles'
