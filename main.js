@@ -14,19 +14,12 @@ let updateStylesTimeout = null // スタイル更新の遅延用タイマー
 // リソース管理用のグローバル変数
 let commentInsertObserver = null // コメント挿入監視用Observer
 let fullscreenObserver = null // フルスクリーン監視用Observer
-let tableBodyHeightObserver = null // tableBodyの高さ監視用Observer
 let contentsTabPanelObserver = null // contents-tab-panel監視用Observer
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
-const STICKY_BOTTOM_THRESHOLD_PX = 60 // 底追従とみなすしきい値(px)。数行ぶんの余裕を持たせる
-let stickyToBottom = true // 底に追従する状態
-let lastScrollTop = 0 // 直近のスクロール位置（上方向スクロール検出用）
-let autoScrollToken = 0 // 自動スクロール予約のキャンセル用トークン
-let autoScrollRafId = null // 自動スクロール用 rAF の参照
-let scrollListenerElement = null // 現在スクロールリスナーを付与している要素
-let boundScrollHandler = null // スクロールハンドラー参照（remove用）
+// 底追従・自動スクロールは inject.js(メインワールド)が担当する
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -145,18 +138,11 @@ function disableExtensionTemporarily() {
 function enableExtensionTemporarily() {
     createCommentStyles()
     updateCommentStyles(true)
-    attachScrollListener()
     removeNoBorderStyle()
 
     // 既存のコメントに弾幕判定を適用
     processComments()
-
-    // 有効化時は底追従状態にして自動スクロール
-    stickyToBottom = true
-    requestAutoScroll()
-
-    // tableBodyの高さ監視を開始
-    startTableBodyHeightMonitoring()
+    // 底追従とスクロールは inject.js(メインワールド)が担当する
 }
 
 /**
@@ -282,13 +268,8 @@ function startCommentMonitoring(targetNode) {
 
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
-
             processComments(newTableRows)
-
-            // 自動スクロール処理（底追従中なら真の底へ）
-            if (newTableRows.length > 0) {
-                requestAutoScroll()
-            }
+            // 底追従は inject.js(メインワールド)が担当する
         }
     })
 
@@ -310,11 +291,6 @@ function scheduleInitialization(targetNode) {
         if (!isInitialized) {
             initializeApp(targetNode)
             isInitialized = true
-
-            // 初期化後にスクロール位置を調整
-            setTimeout(() => {
-                requestAutoScroll()
-            }, 300)
         }
     }, 500)
 }
@@ -331,12 +307,6 @@ function initializeApp(targetNode) {
 
     // 既存のコメントに弾幕判定を適用
     processComments()
-
-    // スクロールリスナーを追加
-    attachScrollListener()
-
-    // tableBodyの高さ監視を開始
-    startTableBodyHeightMonitoring()
 
     // 設定画面を表示
     insertSettingPanel(targetNode)
@@ -388,10 +358,6 @@ function cleanupResources() {
         clearTimeout(updateStylesTimeout)
         updateStylesTimeout = null
     }
-    if (autoScrollRafId) {
-        cancelAnimationFrame(autoScrollRafId)
-        autoScrollRafId = null
-    }
     if (initializationTimeout) {
         clearTimeout(initializationTimeout)
         initializationTimeout = null
@@ -406,24 +372,11 @@ function cleanupResources() {
         fullscreenObserver.disconnect()
         fullscreenObserver = null
     }
-    if (tableBodyHeightObserver) {
-        tableBodyHeightObserver.disconnect()
-        tableBodyHeightObserver = null
-    }
     if (contentsTabPanelObserver) {
         contentsTabPanelObserver.disconnect()
         contentsTabPanelObserver = null
     }
 
-    // スクロールリスナーのクリーンアップ
-    try {
-        if (scrollListenerElement && boundScrollHandler) {
-            scrollListenerElement.removeEventListener('scroll', boundScrollHandler)
-        }
-    } catch (e) {
-    }
-    boundScrollHandler = null
-    scrollListenerElement = null
     isInitialized = false
 
     // フルスクリーンイベントリスナーのクリーンアップ
@@ -432,38 +385,6 @@ function cleanupResources() {
         document.removeEventListener('webkitfullscreenchange', fullscreenCheckFunction)
         document.removeEventListener('mozfullscreenchange', fullscreenCheckFunction)
         fullscreenCheckFunction = null
-    }
-}
-
-// コメント欄のスクロールを監視し、底追従状態(stickyToBottom)を位置から冪等に更新する。
-// scroll イベントはスクロール位置が変わった時だけ発火し、コメント追加（高さ変化）では
-// 発火しないため、自分の自動スクロールも手動スクロールも同じ判定式で正しく扱える。
-function attachScrollListener() {
-    try {
-        // 機能拡張が無効またはパネルが存在しない場合はスキップ
-        if (!isExtensionEnabled || !isTabPanelAvailable) return
-
-        const tableBody = getScrollContainer()
-        if (!tableBody) return
-
-        // 既に同じ要素へ付与済みなら何もしない
-        if (scrollListenerElement === tableBody && boundScrollHandler) return
-
-        // 別の要素へ付いていれば外してから張り替える
-        if (scrollListenerElement && boundScrollHandler) {
-            try {
-                scrollListenerElement.removeEventListener('scroll', boundScrollHandler)
-            } catch (e) {}
-        }
-
-        boundScrollHandler = () => updateStickiness()
-        tableBody.addEventListener('scroll', boundScrollHandler, { passive: true })
-        scrollListenerElement = tableBody
-
-        // 付与時点の位置で初期状態を確定
-        updateStickiness()
-    } catch (error) {
-        // console.warn('スクロールリスナーの設定中にエラーが発生しました:', error)
     }
 }
 
@@ -590,11 +511,6 @@ function insertSettingPanel(targetNode) {
         isShowFullComment = this.checked
         saveSettings({ isShowFullComment }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
-        
-        // 折り返し設定変更後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     })
 
     // スライダーのイベントリスナー
@@ -605,11 +521,6 @@ function insertSettingPanel(targetNode) {
         commentNumberSizeLabel.textContent = commentNumberFontSize
         saveSettings({ commentNumberFontSize }) // 遅延保存
         updateCommentStyles() // 遅延更新
-        
-        // サイズ変更後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     })
 
     commentTextSlider.addEventListener('input', function () {
@@ -619,11 +530,6 @@ function insertSettingPanel(targetNode) {
         commentTextSizeLabel.textContent = commentTextFontSize
         saveSettings({ commentTextFontSize }) // 遅延保存
         updateCommentStyles() // 遅延更新
-        
-        // サイズ変更後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     })
 
     // ダブルクリックでデフォルトサイズにリセット
@@ -635,11 +541,6 @@ function insertSettingPanel(targetNode) {
         commentNumberSlider.value = parseInt(defaultCommentNumberFontSize) || 100
         saveSettings({ commentNumberFontSize }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
-        
-        // リセット後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     })
 
     commentTextSlider.addEventListener('dblclick', function () {
@@ -650,11 +551,6 @@ function insertSettingPanel(targetNode) {
         commentTextSlider.value = parseInt(defaultCommentTextFontSize) || 100
         saveSettings({ commentTextFontSize }, true) // 即座に保存
         updateCommentStyles(true) // 即座に更新
-        
-        // リセット後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     })
 
     // ホイールイベントを追加
@@ -676,11 +572,6 @@ function insertSettingPanel(targetNode) {
             commentTextFontSize = newValue + '%' // 更新されたサイズをセット
         }
         updateCommentStyles() // 遅延更新
-        
-        // ホイール変更後に自動スクロールを実行
-        setTimeout(() => {
-            requestAutoScroll()
-        }, 100)
     }
 
     // コメント番号ホイールイベント
@@ -929,78 +820,6 @@ function removeCommentStyles() {
     }
 }
 
-// コメント欄（スクロール対象）を取得
-function getScrollContainer() {
-    return document.querySelector('[class*="_body_"]')
-}
-
-// 底からの距離(px)。要素が無ければ Infinity（=底ではない扱い）
-function getDistanceFromBottom(el) {
-    if (!el) return Infinity
-    const scrollTop = el.scrollTop || 0
-    const scrollHeight = el.scrollHeight || 0
-    const clientHeight = el.clientHeight || 0
-    return scrollHeight - scrollTop - clientHeight
-}
-
-// スクロール位置の「動いた向き」から底追従状態を更新する。
-// ・上へ動いた(scrollTopが減った) → 量に関わらず追従を止める（ゆっくり上スクロールでも
-//   引き戻されないようにする）
-// ・下へ動いて底付近に達した → 追従を再開する
-// ・下へ動いたが底から遠い（自動スクロールの追いつき途中や、scrollイベントの遅延配送）→ 状態維持
-// 自動スクロールやコメント追加では scrollTop は減らないため、誤って停止することがない。
-function updateStickiness() {
-    const el = getScrollContainer()
-    if (!el) return
-    const top = el.scrollTop || 0
-    const dist = getDistanceFromBottom(el)
-
-    if (top < lastScrollTop - 2) {
-        // ユーザーが上方向へスクロールした → 追従を止める
-        stickyToBottom = false
-    } else if (dist <= STICKY_BOTTOM_THRESHOLD_PX) {
-        // 底付近にいる（下方向スクロール or 自動スクロール）→ 追従する
-        stickyToBottom = true
-    }
-
-    lastScrollTop = top
-}
-
-// 真の底（scrollHeight）へスクロール
-function scrollToBottom() {
-    try {
-        const tableBody = getScrollContainer()
-        if (!tableBody || typeof tableBody.scrollTo !== 'function') return
-        tableBody.scrollTo({ top: tableBody.scrollHeight || 0, behavior: 'auto' })
-    } catch (error) {
-        // console.warn('スクロール実行中にエラーが発生しました:', error)
-    }
-}
-
-// 底追従中のときだけ、レイアウト確定後の次フレームで底へスクロール。
-// 連続呼び出しはトークンで最新の予約だけを有効にする。
-function requestAutoScroll() {
-    try {
-        if (!stickyToBottom) return
-        // inject.js(メインワールド)が「ユーザーは上スクロール中」と判断している間は、
-        // 拡張側からも底へスクロールしない（番人と衝突させない）。
-        if (document.documentElement.dataset.crFollow === '0') return
-        if (!getScrollContainer()) return
-
-        autoScrollToken += 1
-        const myToken = autoScrollToken
-        if (autoScrollRafId) cancelAnimationFrame(autoScrollRafId)
-
-        autoScrollRafId = requestAnimationFrame(() => {
-            autoScrollRafId = null
-            if (myToken !== autoScrollToken) return
-            if (!stickyToBottom) return
-            scrollToBottom()
-        })
-    } catch (error) {
-    }
-}
-
 // 弾幕判定関数
 function isDanmakuComment(comment) {
     try {
@@ -1154,45 +973,4 @@ function addNoBorderStyle() {
 function removeNoBorderStyle() {
     const style = document.getElementById('no-border-style')
     if (style) style.remove()
-}
-
-/**
- * tableBodyの高さ変化を監視
- */
-function startTableBodyHeightMonitoring() {
-    try {
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) {
-            // console.warn('tableBody要素が見つかりません')
-            return
-        }
-
-        // 既存のObserverがある場合は切断
-        if (tableBodyHeightObserver) {
-            tableBodyHeightObserver.disconnect()
-        }
-
-        // 初期高さを記録
-        let previousHeight = tableBody.offsetHeight
-
-        tableBodyHeightObserver = new ResizeObserver(entries => {
-            try {
-                for (const entry of entries) {
-                    const currentHeight = entry.contentRect.height
-                    
-                    // 高さが変わった場合（底追従中なら底へ）
-                    if (currentHeight !== previousHeight) {
-                        requestAutoScroll()
-                        previousHeight = currentHeight
-                    }
-                }
-            } catch (error) {
-                // console.warn('tableBody高さ監視中にエラーが発生しました:', error)
-            }
-        })
-
-        tableBodyHeightObserver.observe(tableBody)
-    } catch (error) {
-        // console.warn('tableBody高さ監視設定中にエラーが発生しました:', error)
-    }
 }
