@@ -2,9 +2,19 @@
     "manifest_version": 3,
     "name": "ニコ生コメントサイズ調整",
     "description": "ニコ生のコメント欄の文字サイズを調整できます。",
-    "version": "1.2.5",
+    "version": "1.2.6",
     "author": "MynicoTools",
     "content_scripts": [
+        {
+            "matches": [
+                "https://live.nicovideo.jp/watch/*"
+            ],
+            "js": [
+                "inject.js"
+            ],
+            "run_at": "document_start",
+            "world": "MAIN"
+        },
         {
             "matches": [
                 "https://live.nicovideo.jp/watch/*"

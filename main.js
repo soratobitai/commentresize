@@ -8,35 +8,25 @@ let commentNumberFontSize = defaultCommentNumberFontSize
 let commentTextFontSize = defaultCommentTextFontSize
 let isShowFullComment = defaultIsShowFullComment
 let isExtensionEnabled = defaultIsExtensionEnabled // 機能拡張の有効/無効フラグ（ユーザー設定）
-let isWheelActive = false // スクロール中かどうかのフラグ
 let saveTimeout = null // 保存の遅延用タイマー
 let updateStylesTimeout = null // スタイル更新の遅延用タイマー
 
 // リソース管理用のグローバル変数
-let wheelEventTimeout = null // ホイールイベント用タイマー
 let commentInsertObserver = null // コメント挿入監視用Observer
 let fullscreenObserver = null // フルスクリーン監視用Observer
 let tableBodyHeightObserver = null // tableBodyの高さ監視用Observer
 let contentsTabPanelObserver = null // contents-tab-panel監視用Observer
-let isWheelEventAttached = false // ホイールイベント重複防止フラグ
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
-const STICKY_BOTTOM_THRESHOLD_PX = 40 // 底貼り付きを判定するしきい値(px)
-const DOUBLE_TOGGLE_INTERVAL_MS = 10 // 二回クリックの間隔(ms)
-let stickyToBottom = true // 底に貼り付く状態
-let isScrollEventAttached = false // スクロールイベント重複防止フラグ
-let isProgrammaticScroll = false // プログラムによるスクロール中はtrue
-let autoScrollRafId1 = null // rAF スケジューラ（1段目）
-let autoScrollRafId2 = null // rAF スケジューラ（2段目）
-let autoScrollToken = 0 // スクロール予約のキャンセル用トークン
-let isLatestHookAttached = false // 「最新コメントに戻る」フック重複防止フラグ
+const STICKY_BOTTOM_THRESHOLD_PX = 60 // 底追従とみなすしきい値(px)。数行ぶんの余裕を持たせる
+let stickyToBottom = true // 底に追従する状態
+let lastScrollTop = 0 // 直近のスクロール位置（上方向スクロール検出用）
+let autoScrollToken = 0 // 自動スクロール予約のキャンセル用トークン
+let autoScrollRafId = null // 自動スクロール用 rAF の参照
 let scrollListenerElement = null // 現在スクロールリスナーを付与している要素
-let wheelListenerElement = null // 現在ホイールリスナーを付与している要素
 let boundScrollHandler = null // スクロールハンドラー参照（remove用）
-let boundWheelHandler = null // ホイールハンドラー参照（remove用）
-let scrollEventTimeout = null // スクロール操作の一時的な抑止用
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -155,15 +145,16 @@ function disableExtensionTemporarily() {
 function enableExtensionTemporarily() {
     createCommentStyles()
     updateCommentStyles(true)
-    attachWheelEventForAutoScroll()
+    attachScrollListener()
     removeNoBorderStyle()
-    
+
     // 既存のコメントに弾幕判定を適用
     processComments()
-    
-    // 有効化後に自動スクロール
-    scrollToPosition()
-    
+
+    // 有効化時は底追従状態にして自動スクロール
+    stickyToBottom = true
+    requestAutoScroll()
+
     // tableBodyの高さ監視を開始
     startTableBodyHeightMonitoring()
 }
@@ -294,15 +285,9 @@ function startCommentMonitoring(targetNode) {
 
             processComments(newTableRows)
 
-            // 自動スクロール処理（stickyToBottom を採用）
-            if (newTableRows.length > 0 && !isWheelActive && stickyToBottom) {
-                const tableBody = newTableRows[0]?.parentElement?.parentElement
-                if (tableBody) {
-                    const lastRow = newTableRows[newTableRows.length - 1]
-                    if (lastRow) {
-                        scheduleAutoScroll(() => lastRow.offsetTop - tableBody.offsetTop)
-                    }
-                }
+            // 自動スクロール処理（底追従中なら真の底へ）
+            if (newTableRows.length > 0) {
+                requestAutoScroll()
             }
         }
     })
@@ -328,7 +313,7 @@ function scheduleInitialization(targetNode) {
 
             // 初期化後にスクロール位置を調整
             setTimeout(() => {
-                scheduleAutoScroll(() => 'bottom')
+                requestAutoScroll()
             }, 300)
         }
     }, 500)
@@ -347,9 +332,9 @@ function initializeApp(targetNode) {
     // 既存のコメントに弾幕判定を適用
     processComments()
 
-    // ホイールイベントを追加
-    attachWheelEventForAutoScroll()
-    
+    // スクロールリスナーを追加
+    attachScrollListener()
+
     // tableBodyの高さ監視を開始
     startTableBodyHeightMonitoring()
 
@@ -361,9 +346,6 @@ function initializeApp(targetNode) {
 
     // contents-tab-panelの監視を開始
     startContentsTabPanelMonitoring(targetNode)
-
-	// 「最新コメントに戻る」クリック時にエモーションパネルをダブルトグル
-	attachLatestCommentResetHook()
 }
 
 /**
@@ -406,9 +388,9 @@ function cleanupResources() {
         clearTimeout(updateStylesTimeout)
         updateStylesTimeout = null
     }
-    if (wheelEventTimeout) {
-        clearTimeout(wheelEventTimeout)
-        wheelEventTimeout = null
+    if (autoScrollRafId) {
+        cancelAnimationFrame(autoScrollRafId)
+        autoScrollRafId = null
     }
     if (initializationTimeout) {
         clearTimeout(initializationTimeout)
@@ -433,24 +415,15 @@ function cleanupResources() {
         contentsTabPanelObserver = null
     }
 
-    // フラグのリセット
-    isWheelEventAttached = false
-    isScrollEventAttached = false
-    // イベントリスナーのクリーンアップ
+    // スクロールリスナーのクリーンアップ
     try {
-        const currentBody = document.querySelector('[class*="_body_"]')
-        if (currentBody && boundScrollHandler) {
-            currentBody.removeEventListener('scroll', boundScrollHandler)
+        if (scrollListenerElement && boundScrollHandler) {
+            scrollListenerElement.removeEventListener('scroll', boundScrollHandler)
         }
-        if (currentBody && boundWheelHandler) {
-            currentBody.removeEventListener('wheel', boundWheelHandler)
-        }
-        boundScrollHandler = null
-        boundWheelHandler = null
-        scrollListenerElement = null
-        wheelListenerElement = null
     } catch (e) {
     }
+    boundScrollHandler = null
+    scrollListenerElement = null
     isInitialized = false
 
     // フルスクリーンイベントリスナーのクリーンアップ
@@ -462,94 +435,35 @@ function cleanupResources() {
     }
 }
 
-function attachWheelEventForAutoScroll() {
+// コメント欄のスクロールを監視し、底追従状態(stickyToBottom)を位置から冪等に更新する。
+// scroll イベントはスクロール位置が変わった時だけ発火し、コメント追加（高さ変化）では
+// 発火しないため、自分の自動スクロールも手動スクロールも同じ判定式で正しく扱える。
+function attachScrollListener() {
     try {
         // 機能拡張が無効またはパネルが存在しない場合はスキップ
         if (!isExtensionEnabled || !isTabPanelAvailable) return
 
-        // 既にイベントが追加されている場合はスキップ
-        if (isWheelEventAttached && wheelListenerElement && scrollListenerElement) {
-            // 既に現在の要素に結び付いている場合のみスキップ
-            const current = document.querySelector('[class*="_body_"]')
-            if (current && current === wheelListenerElement && current === scrollListenerElement) {
-                return
-            }
-            // 要素が変わっている場合は既存リスナーを外して張り替える
+        const tableBody = getScrollContainer()
+        if (!tableBody) return
+
+        // 既に同じ要素へ付与済みなら何もしない
+        if (scrollListenerElement === tableBody && boundScrollHandler) return
+
+        // 別の要素へ付いていれば外してから張り替える
+        if (scrollListenerElement && boundScrollHandler) {
             try {
-                if (wheelListenerElement && boundWheelHandler) {
-                    wheelListenerElement.removeEventListener('wheel', boundWheelHandler)
-                }
-                if (scrollListenerElement && boundScrollHandler) {
-                    scrollListenerElement.removeEventListener('scroll', boundScrollHandler)
-                }
+                scrollListenerElement.removeEventListener('scroll', boundScrollHandler)
             } catch (e) {}
-            isWheelEventAttached = false
-            isScrollEventAttached = false
-            wheelListenerElement = null
-            scrollListenerElement = null
         }
 
-        // マウスホイール操作を検出
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) {
-            // console.warn('ホイールイベント対象の要素が見つかりません')
-            return
-        }
+        boundScrollHandler = () => updateStickiness()
+        tableBody.addEventListener('scroll', boundScrollHandler, { passive: true })
+        scrollListenerElement = tableBody
 
-        boundWheelHandler = () => {
-            try {
-                // 機能拡張が無効またはパネルが存在しない場合は処理をスキップ
-                if (!isExtensionEnabled || !isTabPanelAvailable) return
-
-                isWheelActive = true // ホイール操作中はtrueに設定
-
-                // 既存のタイマーをクリアして再設定
-                if (wheelEventTimeout) {
-                    clearTimeout(wheelEventTimeout)
-                }
-
-                if (isScrollAtBottom()) {
-                    isWheelActive = false
-                }
-
-                // 一定時間後にフラグをfalseに戻す
-                wheelEventTimeout = setTimeout(() => {
-                    isWheelActive = false
-                }, 1000)
-            } catch (error) {
-                // console.warn('ホイールイベント処理中にエラーが発生しました:', error)
-                isWheelActive = false
-            }
-        }
-        tableBody.addEventListener('wheel', boundWheelHandler)
-        wheelListenerElement = tableBody
-
-        // スクロールイベントで stickyToBottom を維持/解除
-        if (!isScrollEventAttached) {
-            boundScrollHandler = () => {
-                try {
-                    if (isProgrammaticScroll) return // プログラムスクロールは無視
-                    // 手動スクロール中は一時的に自動スクロールを抑止
-                    isWheelActive = true
-                    if (scrollEventTimeout) clearTimeout(scrollEventTimeout)
-                    scrollEventTimeout = setTimeout(() => { isWheelActive = false }, 800)
-                    const atBottom = isScrollAtBottomWithThreshold()
-                    if (atBottom) {
-                        stickyToBottom = true
-                    } else {
-                        stickyToBottom = false
-                    }
-                } catch (error) {
-                }
-            }
-            tableBody.addEventListener('scroll', boundScrollHandler)
-            scrollListenerElement = tableBody
-            isScrollEventAttached = true
-        }
-
-        isWheelEventAttached = true
+        // 付与時点の位置で初期状態を確定
+        updateStickiness()
     } catch (error) {
-        // console.warn('ホイールイベントの設定中にエラーが発生しました:', error)
+        // console.warn('スクロールリスナーの設定中にエラーが発生しました:', error)
     }
 }
 
@@ -679,7 +593,7 @@ function insertSettingPanel(targetNode) {
         
         // 折り返し設定変更後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     })
 
@@ -694,7 +608,7 @@ function insertSettingPanel(targetNode) {
         
         // サイズ変更後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     })
 
@@ -708,7 +622,7 @@ function insertSettingPanel(targetNode) {
         
         // サイズ変更後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     })
 
@@ -724,7 +638,7 @@ function insertSettingPanel(targetNode) {
         
         // リセット後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     })
 
@@ -739,7 +653,7 @@ function insertSettingPanel(targetNode) {
         
         // リセット後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     })
 
@@ -765,7 +679,7 @@ function insertSettingPanel(targetNode) {
         
         // ホイール変更後に自動スクロールを実行
         setTimeout(() => {
-            scrollToPosition()
+            requestAutoScroll()
         }, 100)
     }
 
@@ -1015,147 +929,74 @@ function removeCommentStyles() {
     }
 }
 
-// スクロール
-function scrollToPosition(position = 'bottom') {
+// コメント欄（スクロール対象）を取得
+function getScrollContainer() {
+    return document.querySelector('[class*="_body_"]')
+}
+
+// 底からの距離(px)。要素が無ければ Infinity（=底ではない扱い）
+function getDistanceFromBottom(el) {
+    if (!el) return Infinity
+    const scrollTop = el.scrollTop || 0
+    const scrollHeight = el.scrollHeight || 0
+    const clientHeight = el.clientHeight || 0
+    return scrollHeight - scrollTop - clientHeight
+}
+
+// スクロール位置の「動いた向き」から底追従状態を更新する。
+// ・上へ動いた(scrollTopが減った) → 量に関わらず追従を止める（ゆっくり上スクロールでも
+//   引き戻されないようにする）
+// ・下へ動いて底付近に達した → 追従を再開する
+// ・下へ動いたが底から遠い（自動スクロールの追いつき途中や、scrollイベントの遅延配送）→ 状態維持
+// 自動スクロールやコメント追加では scrollTop は減らないため、誤って停止することがない。
+function updateStickiness() {
+    const el = getScrollContainer()
+    if (!el) return
+    const top = el.scrollTop || 0
+    const dist = getDistanceFromBottom(el)
+
+    if (top < lastScrollTop - 2) {
+        // ユーザーが上方向へスクロールした → 追従を止める
+        stickyToBottom = false
+    } else if (dist <= STICKY_BOTTOM_THRESHOLD_PX) {
+        // 底付近にいる（下方向スクロール or 自動スクロール）→ 追従する
+        stickyToBottom = true
+    }
+
+    lastScrollTop = top
+}
+
+// 真の底（scrollHeight）へスクロール
+function scrollToBottom() {
     try {
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) {
-            // console.warn('スクロール対象の要素が見つかりません')
-            return
-        }
-
-        // scrollToメソッドの存在確認
-        if (typeof tableBody.scrollTo !== 'function') {
-            // console.warn('scrollToメソッドが利用できません')
-            return
-        }
-
-        const isBottom = position === 'bottom'
-        const isNumber = typeof position === 'number'
-
-        const scrollOptions = {
-            top: isBottom
-                ? tableBody.scrollHeight || 0
-                : (tableBody.scrollTop || 0) + (isNumber ? position : 0),
-            behavior: 'auto'
-        }
-
-        isProgrammaticScroll = true
-        tableBody.scrollTo(scrollOptions)
-        // 次フレームで自動解除
-        requestAnimationFrame(() => { isProgrammaticScroll = false })
+        const tableBody = getScrollContainer()
+        if (!tableBody || typeof tableBody.scrollTo !== 'function') return
+        tableBody.scrollTo({ top: tableBody.scrollHeight || 0, behavior: 'auto' })
     } catch (error) {
         // console.warn('スクロール実行中にエラーが発生しました:', error)
     }
 }
 
-// スクロール位置が一番下にあるか
-function isScrollAtBottom() {
+// 底追従中のときだけ、レイアウト確定後の次フレームで底へスクロール。
+// 連続呼び出しはトークンで最新の予約だけを有効にする。
+function requestAutoScroll() {
     try {
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) {
-            // console.warn('スクロール要素が見つかりません')
-            return false
-        }
+        if (!stickyToBottom) return
+        // inject.js(メインワールド)が「ユーザーは上スクロール中」と判断している間は、
+        // 拡張側からも底へスクロールしない（番人と衝突させない）。
+        if (document.documentElement.dataset.crFollow === '0') return
+        if (!getScrollContainer()) return
 
-        // 要素のスクロール位置と高さを取得
-        const scrollTop = tableBody.scrollTop || 0
-        const scrollHeight = tableBody.scrollHeight || 0
-        const clientHeight = tableBody.clientHeight || 0
-
-        // スクロールバーが一番下にあるかをチェック
-        return scrollTop + clientHeight >= scrollHeight - 1
-    } catch (error) {
-        // console.warn('スクロール位置の確認中にエラーが発生しました:', error)
-        return false
-    }
-}
-
-// しきい値付きの最下部判定
-function isScrollAtBottomWithThreshold() {
-    try {
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) {
-            return false
-        }
-
-        const scrollTop = tableBody.scrollTop || 0
-        const scrollHeight = tableBody.scrollHeight || 0
-        const clientHeight = tableBody.clientHeight || 0
-
-        return (scrollTop + clientHeight) >= (scrollHeight - STICKY_BOTTOM_THRESHOLD_PX)
-    } catch (error) {
-        return false
-    }
-}
-
-// 二段階 rAF による確実な自動スクロールスケジューラ
-// getPosition: () => number | 'bottom'
-function scheduleAutoScroll(getPosition) {
-    try {
-        if (!stickyToBottom || isWheelActive) return
-        const tableBody = document.querySelector('[class*="_body_"]')
-        if (!tableBody) return
-
-        // 既存予約のキャンセル
         autoScrollToken += 1
         const myToken = autoScrollToken
-        if (autoScrollRafId1) cancelAnimationFrame(autoScrollRafId1)
-        if (autoScrollRafId2) cancelAnimationFrame(autoScrollRafId2)
+        if (autoScrollRafId) cancelAnimationFrame(autoScrollRafId)
 
-        autoScrollRafId1 = requestAnimationFrame(() => {
+        autoScrollRafId = requestAnimationFrame(() => {
+            autoScrollRafId = null
             if (myToken !== autoScrollToken) return
-            // レイアウト確定後の次フレームでスクロールを実行
-            autoScrollRafId2 = requestAnimationFrame(() => {
-                if (myToken !== autoScrollToken) return
-                try {
-                    const pos = typeof getPosition === 'function' ? getPosition() : 'bottom'
-                    scrollToPosition(pos)
-                } catch (e) {
-                }
-            })
+            if (!stickyToBottom) return
+            scrollToBottom()
         })
-    } catch (error) {
-    }
-}
-
-// 「最新コメントに戻る」クリック時にエモーションパネルをダブルトグル
-function attachLatestCommentResetHook() {
-    try {
-        if (isLatestHookAttached) return
-
-        document.addEventListener('click', (event) => {
-            try {
-                const target = event.target
-                if (!target) return
-
-                // 「最新コメントに戻る」ボタンかどうか（aria-labelで判定）
-                const isLatestButton = (target.closest('[aria-label="最新コメントに戻る"]') != null)
-                if (!isLatestButton) return
-
-                // エモーションパネルの開閉ボタンを取得
-                const emotionToggle = document.querySelector('[aria-label="エモーションパネルの開閉"]')
-
-                // フォールバック: エモーションが無い場合は「ギフト」ボタンを対象にする
-                const giftButton = emotionToggle ? null : (document.querySelector('button[aria-label="ギフト"][data-content-type="nagead"][data-target-order="1"]') || document.querySelector('button[aria-label="ギフト"]'))
-                const targetButton = emotionToggle || giftButton
-                if (!targetButton) return
-
-                // 1回目のクリック
-                targetButton.click()
-
-                // 間隔をおいて2回目のクリック（同じ要素を再使用）
-                setTimeout(() => {
-                    try {
-                        targetButton.click()
-                    } catch (e) {
-                    }
-                }, DOUBLE_TOGGLE_INTERVAL_MS)
-            } catch (error) {
-            }
-        }, true)
-
-        isLatestHookAttached = true
     } catch (error) {
     }
 }
@@ -1339,14 +1180,9 @@ function startTableBodyHeightMonitoring() {
                 for (const entry of entries) {
                     const currentHeight = entry.contentRect.height
                     
-                    // 高さが変わった場合
+                    // 高さが変わった場合（底追従中なら底へ）
                     if (currentHeight !== previousHeight) {
-                        // stickyToBottom の場合のみ自動スクロール
-                        if (stickyToBottom && !isWheelActive) {
-                            setTimeout(() => {
-                                scheduleAutoScroll(() => 'bottom')
-                            }, 100)
-                        }
+                        requestAutoScroll()
                         previousHeight = currentHeight
                     }
                 }
