@@ -24,8 +24,10 @@
     'use strict'
 
     const NEAR_BOTTOM_PX = 8 // これ以下なら「底にいる＝追従」とみなす
+    const FORCE_PIN_MS = 1500 // 「最新コメントに戻る」後、この間は追従を外さず底へ貼り付ける
     let following = true     // 底に追従中か（初期は追従）
     let selfScrolling = false // このスクリプト自身による pin 中はゲートを通す
+    let forcePinUntil = 0    // この時刻(performance.now)までは強制追従（余白対策）
 
     const isCommentContainer = (el) =>
         el && el.nodeType === 1 && typeof el.matches === 'function' && el.matches('[class*="_body_"]')
@@ -72,6 +74,8 @@
     document.addEventListener('scroll', (e) => {
         const el = e.target
         if (!isCommentContainer(el)) return
+        // 強制追従ウィンドウ中は、再描画の揺れで追従を外さない（余白＝追従喪失の防止）
+        if (performance.now() < forcePinUntil) { setFollowing(true); return }
         setFollowing(distFromBottom(el) <= NEAR_BOTTOM_PX)
     }, { capture: true, passive: true })
 
@@ -80,9 +84,37 @@
     document.addEventListener('click', (e) => {
         const t = e.target
         if (t && typeof t.closest === 'function' && t.closest('[aria-label="最新コメントに戻る"]')) {
+            // 追従ONにし、再描画が落ち着くまで強制的に底へ貼り付ける（先頭飛び・余白対策）
             setFollowing(true)
+            forcePinUntil = performance.now() + FORCE_PIN_MS
+            forcePinLoop()
+            // niconico に高さを再計算させて、行数より大きく確保された余白を畳む
+            triggerRelayout()
         }
     }, { capture: true })
+
+    // 強制追従ウィンドウの間、毎フレーム底へ貼り付けて niconico を底レイアウトへ収束させる
+    function forcePinLoop() {
+        const el = document.querySelector('[class*="_body_"]')
+        if (el) pinToBottom(el)
+        if (performance.now() < forcePinUntil) requestAnimationFrame(forcePinLoop)
+    }
+
+    // コメント欄のサイズを一瞬変える操作で niconico の ResizeObserver を発火させ、
+    // 仮想スクロールの行高さ・確保高さを再計算させる（余白の解消）。
+    // エモーションパネルの開閉はコメント欄の高さを変えるため再計算のトリガになる。
+    // 先頭へ飛ぶ副作用は forcePinLoop（底への強制追従）が相殺する。
+    function triggerRelayout() {
+        try {
+            const emotion = document.querySelector('[aria-label="エモーションパネルの開閉"]')
+            const target = emotion
+                || document.querySelector('button[aria-label="ギフト"][data-content-type="nagead"][data-target-order="1"]')
+                || document.querySelector('button[aria-label="ギフト"]')
+            if (!target) return
+            target.click()
+            setTimeout(() => { try { target.click() } catch (_) {} }, 30) // 開→閉で元に戻す
+        } catch (_) {}
+    }
 
     // 追従中は常に「真の底」へ。文字拡大で niconico のスクロールが底まで届かず
     // 最新コメントが見切れる問題を、ここで吸収する。
