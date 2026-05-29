@@ -88,8 +88,8 @@
             setFollowing(true)
             forcePinUntil = performance.now() + FORCE_PIN_MS
             forcePinLoop()
-            // niconico に高さを再計算させて、行数より大きく確保された余白を畳む
-            triggerRelayout()
+            // rowHeightPx を実際に合わせて余白を根治。到達できなければエモーショントグルにフォールバック
+            if (!syncRowHeight()) triggerRelayout()
         }
     }, { capture: true })
 
@@ -100,9 +100,59 @@
         if (performance.now() < forcePinUntil) requestAnimationFrame(forcePinLoop)
     }
 
+    // ===== 本質解: niconico の仮想スクロール行高さ(rowHeightPx)を実際に合わせ込む =====
+    // niconico は最初の1行を1回だけ計測した固定 rowHeightPx で全行を扱う（改行/サイズ変化に非対応）。
+    // 拡張で行高さが変わると rowHeightPx とズレ、描画行数・確保高さ・余白の計算が狂う。
+    // React fiber 経由で calculator に到達し、実際の行高さへ補正して再描画させることで根治する。
+    // fiber/内部名が見つからない（niconico更新等）場合は false を返し、呼び出し側がフォールバックする。
+
+    // 代表的な行高さ（描画中の行の中央値）。単一行モードならほぼ一定値になる。
+    function representativeRowHeight() {
+        const el = document.querySelector('[class*="_body_"]')
+        if (!el) return 0
+        const hs = Array.from(el.querySelectorAll('.table-row')).map(r => r.offsetHeight).filter(h => h > 0).sort((a, b) => a - b)
+        return hs.length ? hs[Math.floor(hs.length / 2)] : 0
+    }
+
+    // .table-row の React fiber を上方向に辿り、scrollProcessor.calculator を持つ
+    // コンポーネントインスタンス（forceUpdate 可能）を返す。毎回探索する（リマウント対応）。
+    function getScrollComponent() {
+        try {
+            const start = document.querySelector('.table-row') || document.querySelector('[class*="_body_"]')
+            if (!start) return null
+            const fk = Object.keys(start).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'))
+            if (!fk) return null
+            let fiber = start[fk], depth = 0
+            while (fiber && depth < 200) {
+                const sn = fiber.stateNode
+                if (sn && typeof sn === 'object' && sn.scrollProcessor && sn.scrollProcessor.calculator
+                    && ('_rowHeightPx' in sn.scrollProcessor.calculator)) return sn
+                fiber = fiber.return; depth++
+            }
+        } catch (_) {}
+        return null
+    }
+
+    // niconico の rowHeightPx を実際の行高さに同期。変化があった時だけ再描画させる。
+    // 成功すれば true（フォールバック不要）、内部に到達できなければ false。
+    function syncRowHeight() {
+        const comp = getScrollComponent()
+        if (!comp) return false
+        try {
+            const calc = comp.scrollProcessor.calculator
+            const h = representativeRowHeight()
+            if (h > 0 && Math.abs((calc._rowHeightPx || 0) - h) >= 2) {
+                calc._rowHeightPx = h
+                if (typeof comp.forceUpdateDeep === 'function') comp.forceUpdateDeep()
+                else if (typeof comp.forceUpdate === 'function') comp.forceUpdate()
+            }
+            return true
+        } catch (_) { return false }
+    }
+
     // コメント欄のサイズを一瞬変える操作で niconico の ResizeObserver を発火させ、
     // 仮想スクロールの行高さ・確保高さを再計算させる（余白の解消）。
-    // エモーションパネルの開閉はコメント欄の高さを変えるため再計算のトリガになる。
+    // ★ fiber 補正(syncRowHeight)が使えない場合のフォールバック。
     // 先頭へ飛ぶ副作用は forcePinLoop（底への強制追従）が相殺する。
     function triggerRelayout() {
         try {
@@ -145,9 +195,17 @@
             observedEl = el
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
+            // コメント欄が新規生成/差し替え（初期表示・エモーション画面から復帰・タブ切替・SPA遷移）された。
+            // 最新へ追従し、内容が確定するまで底へ強制追従して「最新が見えない」を防ぐ。
+            setFollowing(true)
+            forcePinUntil = performance.now() + FORCE_PIN_MS
+            forcePinLoop()
             schedulePin()
         }
+        // niconico の rowHeightPx を実際の行高さに合わせ続ける（余白を根本から防ぐ）。
+        // 変化が無ければ何もしないので頻繁に呼んでも安全。
+        syncRowHeight()
     }
     ensureObserving()
-    setInterval(ensureObserving, 1000) // SPA で要素が差し替わっても追従
+    setInterval(ensureObserving, 300) // 要素差し替え(リマウント)を素早く検出＋rowHeightPx同期
 })()

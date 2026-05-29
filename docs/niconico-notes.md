@@ -35,6 +35,36 @@
   これを利用し、本拡張は「メインワールドで `scrollTop`/`scrollTo` をラップして、ユーザーが
   上スクロール中だけニコ生の引き戻しをブロック」している（`inject.js`）。
 
+## 仮想スクロールの行高さ（rowHeightPx）と余白の根本原因 ★最重要
+
+nicolib.js の解析で判明した、ニコ生コメント欄の仮想スクロールの中核ロジック。
+
+- 仮想スクロールは `calculator`（minified class `b`）が **単一の固定 `rowHeightPx`** で全行を扱う：
+  - `scrollHeightPx = rowHeightPx * rowsLength`（全体の高さ）
+  - `frameRowLength = ceil(offsetHeightPx / rowHeightPx)`（描画する行数）
+  - `marginTopPx = startRowIndex * rowHeightPx` / `marginBottomPx = (残り行数) * rowHeightPx`（padding）
+- `rowHeightPx` は **初期化時に最初の1行の `offsetHeight` を1回だけ計測**した値（`initializeCalculator`、
+  `if (initialized) return` で再計測しない）。**改行・サイズ変化に追従しない。**
+- 底へのスクロールは `scrollToNewBottom`（React `componentDidUpdate` 内）が `target.scrollTop = target.scrollHeight`。
+  底判定は `IntersectionObserver`（底のセンチネル `sentinelElement`、`isAtBottomByIO`）。
+- **余白バグの原因**: 本拡張で文字を拡大／行高さが変わると、計測済み `rowHeightPx` と実際の行高さがズレる。
+  `rowHeightPx` が実際より大きいと `frameRowLength` が小さくなり、描画行数が足りずビューポート下部に余白。
+  小さいと逆に過剰描画。実測例: `rowHeightPx=32`（拡張CSSの min-height を空行で計測）に対し実際の行は 100px。
+- **1.2.5 のエモーションパネル2回トグルが効いた理由**: トグルでコメント欄が破棄→再生成（リマウント）され、
+  `rowHeightPx` が再計測されるため。ただしUIハックで、先頭飛び等の副作用があった（1.2.6 で撤去→余白再発）。
+
+### 根本対策（1.2.11、`inject.js`）
+- `.table-row` の React fiber を上方向に辿り、`scrollProcessor.calculator`（`_rowHeightPx` を持つ）に到達。
+  （`__reactFiber$...` キー → `fiber.return` を辿る。`stateNode` がコンポーネント実体で `forceUpdateDeep` も持つ）
+- `calculator._rowHeightPx` を**実際の行高さ（描画中の行の中央値）に同期**し、変化時に `forceUpdateDeep()`/`forceUpdate()`
+  で再描画させる（`syncRowHeight`）。300ms ごと＋リマウント検出時＋「最新コメントに戻る」時に実行。
+- fiber/内部名に到達できない（ニコ生更新で minified 名が変わる等）場合は **エモーショントグル（`triggerRelayout`）に
+  自動フォールバック**するので退行しない。
+- **限界**: 行高さが混在する放送（テキスト42px・スタンプ/画像70px等）は、単一 `rowHeightPx` では完全一致できない
+  （niconico の仕様上の制約）。中央値で最善化するが微小なズレは残りうる。テキスト中心なら完全一致で余白ゼロ。
+- リマウント（エモーション画面から復帰・タブ切替・SPA遷移）時は、コンテナ差し替えを検出して
+  追従ON＋底へ強制追従（`forcePinLoop`, `FORCE_PIN_MS`）し「最新が見えない」を防ぐ。
+
 ## コメントの並び順
 
 - ニコ生は、古いコメントの取得時やほぼ同時刻のコメントを、**受信順（コメント番号順でない）で
