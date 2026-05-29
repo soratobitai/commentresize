@@ -20,6 +20,9 @@ let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
 // 底追従・自動スクロールは inject.js(メインワールド)が担当する
+let sortDebounceTimer = null // コメント並べ替えのデバウンス用タイマー
+let sortScrollHandler = null // 並べ替えトリガ用スクロールハンドラ参照（remove用）
+const SORT_IDLE_MS = 250 // スクロールがこの時間止まったら1回だけ並べ替える
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -316,6 +319,23 @@ function initializeApp(targetNode) {
 
     // contents-tab-panelの監視を開始
     startContentsTabPanelMonitoring(targetNode)
+
+    // コメント番号順の並べ替え：スクロールが止まった時だけ実行（mutation毎は負荷で危険）
+    attachSortOnScrollIdle()
+}
+
+// スクロールが SORT_IDLE_MS 止まったら1回だけ並べ替えるリスナーを document に張る。
+// 連続スクロール中はタイマーが伸び続けて並べ替えは走らないため、仮想スクロールの
+// 再描画と競合せず、激しいスクロール時の DOM 操作の嵐（=クラッシュ）を避けられる。
+function attachSortOnScrollIdle() {
+    if (sortScrollHandler) return // 二重登録防止
+    sortScrollHandler = (event) => {
+        const el = event.target
+        if (!el || typeof el.matches !== 'function' || !el.matches('[class*="_body_"]')) return
+        if (sortDebounceTimer) clearTimeout(sortDebounceTimer)
+        sortDebounceTimer = setTimeout(sortCommentRows, SORT_IDLE_MS)
+    }
+    document.addEventListener('scroll', sortScrollHandler, { capture: true, passive: true })
 }
 
 /**
@@ -361,6 +381,16 @@ function cleanupResources() {
     if (initializationTimeout) {
         clearTimeout(initializationTimeout)
         initializationTimeout = null
+    }
+    if (sortDebounceTimer) {
+        clearTimeout(sortDebounceTimer)
+        sortDebounceTimer = null
+    }
+
+    // 並べ替えトリガのスクロールリスナーを外す
+    if (sortScrollHandler) {
+        document.removeEventListener('scroll', sortScrollHandler, { capture: true })
+        sortScrollHandler = null
     }
 
     // Observerのクリーンアップ
@@ -690,6 +720,50 @@ function processComments(commentRows = null) {
         })
     } catch (error) {
         // console.warn('コメント処理中にエラーが発生しました:', error)
+    }
+}
+
+// コメント欄の行をコメント番号の昇順に並べ替える（スクロール停止時に1回だけ呼ばれる）。
+// ニコ生は古いコメントの取得時などにほぼ同時刻のコメントを受信順（番号順でない）で
+// 挿入することがあり、番号が前後する。表示中の行は通常フロー（スペーサー兄弟なし）なので
+// DOM順を直せば見た目も直る。スクロール静止時に実行するので niconico の再描画と競合しない。
+// 既に昇順なら DOM を触らない。
+function sortCommentRows() {
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
+    try {
+        const rows = Array.from(document.querySelectorAll('.table-row'))
+        if (rows.length < 2) return
+
+        const numberOf = (row) => {
+            const el = row.querySelector('.comment-number')
+            if (!el) return null
+            const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10)
+            return Number.isFinite(n) ? n : null
+        }
+
+        // 既に番号昇順なら並べ替え不要（DOMを触らない）
+        let alreadySorted = true
+        let prev = null
+        for (const row of rows) {
+            const n = numberOf(row)
+            if (n == null) continue // 番号の無い行（運営コメント等）は順序判定から除外
+            if (prev != null && n < prev) { alreadySorted = false; break }
+            prev = n
+        }
+        if (alreadySorted) return
+
+        const parent = rows[0].parentElement
+        if (!parent) return
+
+        // 番号で安定ソート（番号が無い行は元の相対位置を保つ）
+        const ordered = rows
+            .map((row, index) => ({ row, index, n: numberOf(row) }))
+            .sort((a, b) => (a.n == null || b.n == null) ? a.index - b.index : a.n - b.n)
+            .map((o) => o.row)
+
+        ordered.forEach((row) => parent.appendChild(row))
+    } catch (error) {
+        // console.warn('コメント並べ替え中にエラーが発生しました:', error)
     }
 }
 
