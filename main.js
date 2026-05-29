@@ -269,6 +269,8 @@ function startCommentMonitoring(targetNode) {
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
             processComments(newTableRows)
+            // コメント番号順に並べ替える（ニコ生が受信順に挿入して前後する場合がある）
+            sortCommentRows()
             // 底追従は inject.js(メインワールド)が担当する
         }
     })
@@ -690,6 +692,50 @@ function processComments(commentRows = null) {
         })
     } catch (error) {
         // console.warn('コメント処理中にエラーが発生しました:', error)
+    }
+}
+
+// コメント欄の行をコメント番号の昇順に並べ替える。
+// ニコ生は古いコメントの取得時などに、ほぼ同時刻のコメントを受信順（番号順でない）に
+// 挿入することがあり、番号が前後する。表示中の行は通常フロー（スペーサー兄弟なし）なので
+// DOM順を直せば見た目の順序も直る。
+// 既に昇順なら何もしないことで、並べ替え→MutationObserver再発火→…の無限ループを防ぐ。
+function sortCommentRows() {
+    if (!isExtensionEnabled || !isTabPanelAvailable) return
+    try {
+        const rows = Array.from(document.querySelectorAll('.table-row'))
+        if (rows.length < 2) return
+
+        const numberOf = (row) => {
+            const el = row.querySelector('.comment-number')
+            if (!el) return null
+            const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10)
+            return Number.isFinite(n) ? n : null
+        }
+
+        // 既に番号昇順なら並べ替え不要（DOMを触らない＝再発火しない）
+        let alreadySorted = true
+        let prev = null
+        for (const row of rows) {
+            const n = numberOf(row)
+            if (n == null) continue // 番号の無い行（運営コメント等）は順序判定から除外
+            if (prev != null && n < prev) { alreadySorted = false; break }
+            prev = n
+        }
+        if (alreadySorted) return
+
+        const parent = rows[0].parentElement
+        if (!parent) return
+
+        // 番号で安定ソート（番号が無い行は元の相対位置を保つ）
+        const ordered = rows
+            .map((row, index) => ({ row, index, n: numberOf(row) }))
+            .sort((a, b) => (a.n == null || b.n == null) ? a.index - b.index : a.n - b.n)
+            .map((o) => o.row)
+
+        ordered.forEach((row) => parent.appendChild(row))
+    } catch (error) {
+        // console.warn('コメント並べ替え中にエラーが発生しました:', error)
     }
 }
 
