@@ -44,11 +44,15 @@
   `setFollowing(false)` でラッチ → 以後ニコ生の底書き込みは番人ゲート（`!following` で `return`）に
   **全ブロック** → スクロール停止 → 底センチネル（IO）が交差せずニコ生が**新規描画も停止** → 固まる。
   直すはずの `pinIfFollowing` は、まさにOFFになったそのフラグでゲートされ動けない自己ロック。
-- 対策: **追従OFFは「底から離れた」ではなく「ユーザーが上へ動かした」時だけ**にする
-  （ニコ生のプログラム的スクロールは常に下方向、上へ動くのはユーザー操作のみ）。スクロールイベントで
-  `top < 前回top - UNFOLLOW_UP_PX(4px)` の時だけ `setFollowing(false)`、底付近に戻れば ON。
-  undershoot では追従が外れず、届かない分は `pinIfFollowing` が真の底（実 `scrollHeight`）へ押し込む。
-  コンテナ差し替え時は `lastScrollTop=-1` にリセット（scrollTop が0に戻るのを上スクロールと誤検出しない）。
+- 対策: **追従OFFは「実際のユーザー入力」があった時だけ**許可する。
+  - ニコ生のプログラム的スクロールは `wheel`/`touch`/キーを発火しない。一方 scrollTop の「底の座標」は
+    仮想スクロールの再計算で**単調に増えない**ため、増減（方向）だけで判定すると、3〜4行のコメントで
+    scrollTop が一時的に小さくなった時に「上スクロール」と誤検知し追従OFFにラッチ → **底まで届かず止まる**
+    （※増減で判定する初版の固着対策はこの副作用があり、入力ベースへ差し替えた）。
+  - `wheel/touchstart/touchmove/pointerdown/keydown` で `lastUserInputAt` を記録し、scroll イベントでは
+    「底付近(`<=NEAR_BOTTOM_PX`)なら追従ON」「`USER_INPUT_MS(300ms)` 以内のユーザー入力があり底でないなら追従OFF」。
+    それ以外（底でない＆ユーザー入力なし＝再レイアウト/undershoot）は**追従維持**し、`pinIfFollowing` が
+    実際の底（実 `scrollHeight`）へ押し込む。これで誤OFFも固着も底未到達も起きない。
 
 ## 仮想スクロールの行高さ（rowHeightPx）と余白の根本原因 ★最重要
 

@@ -68,29 +68,33 @@
         try { document.documentElement.dataset.crFollow = v ? '1' : '0' } catch (_) {}
     }
 
-    // 追従状態を更新（ユーザーのネイティブスクロールはここで拾える）。
-    // ★固着（フリーズ）対策: 追従OFFは「底から離れた」ではなく「ユーザーが上へ動かした」時だけにする。
-    //   ニコ生のプログラム的スクロールは常に下（底）方向で、上へ動くのはユーザー操作のみ。
-    //   位置だけで判定すると、長い折り返しコメント（4行以上）で底スクロールが真の底に数十px
-    //   届かず distFromBottom>しきい値 になった瞬間に追従OFFへラッチ→以後の底書き込みが
-    //   ゲートで全ブロックされ、スクロールも新規コメント描画も止まる（固まる現象の正体）。
-    //   方向で判定すれば undershoot では外れず、届かない分は pinIfFollowing が底へ押し込む。
-    let lastScrollTop = -1
-    const UNFOLLOW_UP_PX = 4 // これ以上「上」へ動いたらユーザーの上スクロールとみなす
+    // ★追従ON/OFF判定は「実際のユーザー入力」に基づける（固着・底未到達の両対策）。
+    //   ニコ生のプログラム的スクロールは wheel/touch/キーを発火しない。一方 scrollTop の
+    //   「底の座標」は仮想スクロールの再計算で単調に増えないため、増減（方向）だけでユーザー操作と
+    //   ニコ生の再レイアウトを区別すると、3〜4行のコメントで scrollTop が一時的に小さくなった時に
+    //   「上スクロール」と誤検知して追従OFFにラッチ→底まで届かず止まる。
+    //   そこで「直前に本物のユーザー入力があった時だけ追従OFFを許可」する。
+    //   底に届かない undershoot は pinIfFollowing が実際の底へ押し込む。
+    const USER_INPUT_MS = 300 // この時間内のユーザー入力を「ユーザー操作中」とみなす
+    let lastUserInputAt = -1e9
+    const markUserInput = () => { lastUserInputAt = performance.now() }
+    for (const type of ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown']) {
+        document.addEventListener(type, markUserInput, { capture: true, passive: true })
+    }
+
     document.addEventListener('scroll', (e) => {
         const el = e.target
         if (!isCommentContainer(el)) return
-        const top = topDesc.get.call(el)
-        const prev = lastScrollTop
-        lastScrollTop = top
+        const now = performance.now()
         // 強制追従ウィンドウ中は、再描画の揺れで追従を外さない（余白＝追従喪失の防止）
-        if (performance.now() < forcePinUntil) { setFollowing(true); return }
-        if (prev >= 0 && top < prev - UNFOLLOW_UP_PX) {
-            setFollowing(false)            // ユーザーが上へスクロール → 追従解除
-        } else if (distFromBottom(el) <= NEAR_BOTTOM_PX) {
-            setFollowing(true)             // 底付近へ戻った → 追従再開
+        if (now < forcePinUntil) { setFollowing(true); return }
+        if (distFromBottom(el) <= NEAR_BOTTOM_PX) {
+            setFollowing(true)                                 // 底付近 → 追従再開
+        } else if (now - lastUserInputAt < USER_INPUT_MS) {
+            setFollowing(false)                                // ユーザー操作で底から離れた → 追従解除
         }
-        if (following) pinIfFollowing()    // undershoot を真の底へ補正（固着防止）
+        // 底でない＆ユーザー入力なし＝ニコ生の再レイアウト/undershoot → 追従維持＋実際の底へ補正
+        if (following) pinIfFollowing()
     }, { capture: true, passive: true })
 
     // 「最新コメントに戻る」クリックは、ユーザーが追従再開を望んだ合図。
@@ -230,7 +234,6 @@
             try { mo.disconnect() } catch (_) {}
             try { if (ro) ro.disconnect() } catch (_) {}
             observedEl = el
-            lastScrollTop = -1 // 差し替えで scrollTop が 0 に戻るのを「上スクロール」と誤検出しない
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
             // コメント欄が新規生成/差し替え（初期表示・エモーション画面から復帰・タブ切替・SPA遷移）された。
