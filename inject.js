@@ -68,15 +68,29 @@
         try { document.documentElement.dataset.crFollow = v ? '1' : '0' } catch (_) {}
     }
 
-    // 位置から追従状態を更新（ユーザーのネイティブスクロールはここで拾える）。
-    // 底にいれば追従ON、離れれば追従OFF。ブロックされた書き込みは位置を変えず
-    // scroll を発火しないので、追従OFFは維持される。
+    // 追従状態を更新（ユーザーのネイティブスクロールはここで拾える）。
+    // ★固着（フリーズ）対策: 追従OFFは「底から離れた」ではなく「ユーザーが上へ動かした」時だけにする。
+    //   ニコ生のプログラム的スクロールは常に下（底）方向で、上へ動くのはユーザー操作のみ。
+    //   位置だけで判定すると、長い折り返しコメント（4行以上）で底スクロールが真の底に数十px
+    //   届かず distFromBottom>しきい値 になった瞬間に追従OFFへラッチ→以後の底書き込みが
+    //   ゲートで全ブロックされ、スクロールも新規コメント描画も止まる（固まる現象の正体）。
+    //   方向で判定すれば undershoot では外れず、届かない分は pinIfFollowing が底へ押し込む。
+    let lastScrollTop = -1
+    const UNFOLLOW_UP_PX = 4 // これ以上「上」へ動いたらユーザーの上スクロールとみなす
     document.addEventListener('scroll', (e) => {
         const el = e.target
         if (!isCommentContainer(el)) return
+        const top = topDesc.get.call(el)
+        const prev = lastScrollTop
+        lastScrollTop = top
         // 強制追従ウィンドウ中は、再描画の揺れで追従を外さない（余白＝追従喪失の防止）
         if (performance.now() < forcePinUntil) { setFollowing(true); return }
-        setFollowing(distFromBottom(el) <= NEAR_BOTTOM_PX)
+        if (prev >= 0 && top < prev - UNFOLLOW_UP_PX) {
+            setFollowing(false)            // ユーザーが上へスクロール → 追従解除
+        } else if (distFromBottom(el) <= NEAR_BOTTOM_PX) {
+            setFollowing(true)             // 底付近へ戻った → 追従再開
+        }
+        if (following) pinIfFollowing()    // undershoot を真の底へ補正（固着防止）
     }, { capture: true, passive: true })
 
     // 「最新コメントに戻る」クリックは、ユーザーが追従再開を望んだ合図。
@@ -105,13 +119,31 @@
     // 拡張で行高さが変わると rowHeightPx とズレ、描画行数・確保高さ・余白の計算が狂う。
     // React fiber 経由で calculator に到達し、実際の行高さへ補正して再描画させることで根治する。
     // fiber/内部名が見つからない（niconico更新等）場合は false を返し、呼び出し側がフォールバックする。
+    //
+    // ★発振対策（重要）: 以前は「描画中の行の中央値」を rowHeightPx に書き戻していたが、
+    //   中央値は『どの行が描画されるか』に依存し、その描画範囲は rowHeightPx で決まる。
+    //   = 測定対象が制御値に依存する自励発振になり、行高さ混在の放送で
+    //   「余白⇄補正」を繰り返してチカチカした。そこで：
+    //     (1) 中央値ではなく『最小行高さ（実質1行ぶん）』を使う。
+    //         rowHeightPx を実高さ以下にすると描画行数が過剰になり下余白が出ない
+    //         （真の底へは pinToBottom が押し込む）。最小値は描画範囲が変わっても動きにくい。
+    //     (2) 値は下げる方向にのみ追従（単調収束）。フォント拡大時も小さいまま＝余白は出ない。
+    //     (3) calculator と十分ズレた時だけ forceUpdate（定常再描画＝フラッシュを廃止）。
+    //   これで混在環境でも収束し、発振しない。
 
-    // 代表的な行高さ（描画中の行の中央値）。単一行モードならほぼ一定値になる。
-    function representativeRowHeight() {
+    const ROW_MIN_FLOOR = 24 // これ未満（区切り線・空システム行など）は1行とみなさない下限
+    let lockedRowHeight = 0  // 安定値。原則として下げる方向にのみ追従（発振防止）
+
+    // 描画中の行の最小高さ（＝実質1行ぶん）。下限未満の行は除外。
+    function smallestRowHeight() {
         const el = document.querySelector('[class*="_body_"]')
         if (!el) return 0
-        const hs = Array.from(el.querySelectorAll('.table-row')).map(r => r.offsetHeight).filter(h => h > 0).sort((a, b) => a - b)
-        return hs.length ? hs[Math.floor(hs.length / 2)] : 0
+        let min = Infinity
+        for (const r of el.querySelectorAll('.table-row')) {
+            const h = r.offsetHeight
+            if (h >= ROW_MIN_FLOOR && h < min) min = h
+        }
+        return min === Infinity ? 0 : min
     }
 
     // .table-row の React fiber を上方向に辿り、scrollProcessor.calculator を持つ
@@ -133,16 +165,21 @@
         return null
     }
 
-    // niconico の rowHeightPx を実際の行高さに同期。変化があった時だけ再描画させる。
+    // niconico の rowHeightPx を「安定した最小行高さ」へ単調収束させる。
+    // 値が十分ズレた時だけ再描画する（定常 forceUpdate しない＝発振・フラッシュ防止）。
     // 成功すれば true（フォールバック不要）、内部に到達できなければ false。
     function syncRowHeight() {
         const comp = getScrollComponent()
         if (!comp) return false
         try {
             const calc = comp.scrollProcessor.calculator
-            const h = representativeRowHeight()
-            if (h > 0 && Math.abs((calc._rowHeightPx || 0) - h) >= 2) {
-                calc._rowHeightPx = h
+            const h = smallestRowHeight()
+            if (h <= 0) return true
+            // 観測した最小値へ「下げる方向にのみ」追従（小さい方が余白が出ず、発振もしない）
+            if (lockedRowHeight === 0 || h < lockedRowHeight - 1) lockedRowHeight = h
+            // calculator と十分ズレている時だけ書き戻して1回だけ再描画（デッドバンド6px）
+            if (Math.abs((calc._rowHeightPx || 0) - lockedRowHeight) >= 6) {
+                calc._rowHeightPx = lockedRowHeight
                 if (typeof comp.forceUpdateDeep === 'function') comp.forceUpdateDeep()
                 else if (typeof comp.forceUpdate === 'function') comp.forceUpdate()
             }
@@ -193,6 +230,7 @@
             try { mo.disconnect() } catch (_) {}
             try { if (ro) ro.disconnect() } catch (_) {}
             observedEl = el
+            lastScrollTop = -1 // 差し替えで scrollTop が 0 に戻るのを「上スクロール」と誤検出しない
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
             // コメント欄が新規生成/差し替え（初期表示・エモーション画面から復帰・タブ切替・SPA遷移）された。
