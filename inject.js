@@ -39,10 +39,16 @@
     const topDesc = Object.getOwnPropertyDescriptor(proto, 'scrollTop')
     const nativeScrollTo = proto.scrollTo
 
+    // 追従状態に関わらずゲート(下の scrollTop セッター)を迂回して書き込む。
+    // 回復用の書き込みが following=false でゲートに飲まれて自己ロックするのを防ぐ。
+    function selfScrollWrite(el, top) {
+        selfScrolling = true
+        try { topDesc.set.call(el, top) } finally { selfScrolling = false }
+    }
+
     // 自分（pin）はゲートを迂回して本当の底へ
     function pinToBottom(el) {
-        selfScrolling = true
-        try { topDesc.set.call(el, el.scrollHeight) } finally { selfScrolling = false }
+        selfScrollWrite(el, el.scrollHeight)
     }
 
     // scrollTop セッターをラップ：追従していない間、コメント欄への
@@ -106,8 +112,6 @@
             setFollowing(true)
             forcePinUntil = performance.now() + FORCE_PIN_MS
             forcePinLoop()
-            // rowHeightPx を実際に合わせて余白を根治。到達できなければエモーショントグルにフォールバック
-            if (!syncRowHeight()) triggerRelayout()
         }
     }, { capture: true })
 
@@ -118,41 +122,36 @@
         if (performance.now() < forcePinUntil) requestAnimationFrame(forcePinLoop)
     }
 
-    // ===== 本質解: niconico の仮想スクロール行高さ(rowHeightPx)を実際に合わせ込む =====
-    // niconico は最初の1行を1回だけ計測した固定 rowHeightPx で全行を扱う（改行/サイズ変化に非対応）。
-    // 拡張で行高さが変わると rowHeightPx とズレ、描画行数・確保高さ・余白の計算が狂う。
-    // React fiber 経由で calculator に到達し、実際の行高さへ補正して再描画させることで根治する。
-    // fiber/内部名が見つからない（niconico更新等）場合は false を返し、呼び出し側がフォールバックする。
-    //
-    // ★発振対策（重要）: 以前は「描画中の行の中央値」を rowHeightPx に書き戻していたが、
-    //   中央値は『どの行が描画されるか』に依存し、その描画範囲は rowHeightPx で決まる。
-    //   = 測定対象が制御値に依存する自励発振になり、行高さ混在の放送で
-    //   「余白⇄補正」を繰り返してチカチカした。そこで：
-    //     (1) 中央値ではなく『最小行高さ（実質1行ぶん）』を使う。
-    //         rowHeightPx を実高さ以下にすると描画行数が過剰になり下余白が出ない
-    //         （真の底へは pinToBottom が押し込む）。最小値は描画範囲が変わっても動きにくい。
-    //     (2) 値は下げる方向にのみ追従（単調収束）。フォント拡大時も小さいまま＝余白は出ない。
-    //     (3) calculator と十分ズレた時だけ forceUpdate（定常再描画＝フラッシュを廃止）。
-    //   これで混在環境でも収束し、発振しない。
+    // ===== 固まり（フリーズ）の検出と回復（1.2.17）=====
+    // 実機 window.__crFreeze の多視点＋反証検証で機構が確定した:
+    //  - これは仮想スクロールの座標/描画ウィンドウのバグでは「ない」。実測で tableRowCount=15・
+    //    marginTopPx=5920(=185*32) ＝ニコ生は startRowIndex を 185 にクランプし末尾15行（最新含む）を
+    //    正常に描画している。outOfRange(scrollTop>仮想底=rowHeightPx*rowsLength) は無害な見かけだけ
+    //    （1.2.11–1.2.14 および本実装初期の rowHeightPx／行範囲外の各仮説は全て否定された）。
+    //  - 正体は「時間的な描画停止」: 特に背の高い折り返しコメント直後にニコ生の描画が止まり、新着データ
+    //    だけでは再開せず「スクロール操作」を与えるまで固まったまま（ユーザーが手動スクロールで復帰して
+    //    いたのはこのため）。1.2.14 の scrollToNewBottom+pin（スクロール運動を伴わない）では回復せず、
+    //    1.2.15 で底→上→底の programmatic なスクロール運動を入れて初めて自動回復した（実機確認）。
+    //  - 回復は「スクロール運動」で描画を起こし底（最新）へ戻す。1ティック内で完結する同期処理なので
+    //    画面は動いて見えず、最新コメントの見切れも出ない（位置は実際の底のまま＝フル表示）。
+    //  - 1.2.17: 見切れゼロのまま体感停止をなくすため、固まりやすい outOfRange の時だけ検出を素早く
+    //    （しきい値 400ms・ポーリング 200ms）して即回復する。位置クランプ（=最新を画面外へ隠す）は不採用。
+    //    書き込みは全て selfScrollWrite でゲートを迂回（self-lock 防止）。forceUpdate は不使用。
+    //    window.__crFreeze に検出時の決定的項目を記録（tableRowCount/newestInDom/marginTopPx/outOfRange/
+    //    following/clearedAfterMs 等）、window.__crFreezes に直近の履歴（最大40件）。
 
-    const ROW_MIN_FLOOR = 24 // これ未満（区切り線・空システム行など）は1行とみなさない下限
-    let lockedRowHeight = 0  // 安定値。原則として下げる方向にのみ追従（発振防止）
-
-    // 描画中の行の最小高さ（＝実質1行ぶん）。下限未満の行は除外。
-    function smallestRowHeight() {
-        const el = document.querySelector('[class*="_body_"]')
-        if (!el) return 0
-        let min = Infinity
-        for (const r of el.querySelectorAll('.table-row')) {
-            const h = r.offsetHeight
-            if (h >= ROW_MIN_FLOOR && h < min) min = h
-        }
-        return min === Infinity ? 0 : min
-    }
-
-    // .table-row の React fiber を上方向に辿り、scrollProcessor.calculator を持つ
-    // コンポーネントインスタンス（forceUpdate 可能）を返す。毎回探索する（リマウント対応）。
+    // .table-row の React fiber を上方向に辿り、scrollProcessor / calculator を持つ
+    // コンポーネントインスタンスを返す。毎回探索する（リマウント対応）。
+    let _scrollComp = null, _scrollCompAt = -1e9
+    function invalidateScrollComp() { _scrollComp = null }
     function getScrollComponent() {
+        const now = performance.now()
+        // 直近に見つけたインスタンスを再利用（高速ポーリングで毎回 fiber を辿らない）。
+        if (_scrollComp && (now - _scrollCompAt) < 2000) {
+            const sp = _scrollComp.scrollProcessor
+            if (sp && sp.calculator && ('_rowHeightPx' in sp.calculator)) return _scrollComp
+        }
+        _scrollComp = null
         try {
             const start = document.querySelector('.table-row') || document.querySelector('[class*="_body_"]')
             if (!start) return null
@@ -162,49 +161,122 @@
             while (fiber && depth < 200) {
                 const sn = fiber.stateNode
                 if (sn && typeof sn === 'object' && sn.scrollProcessor && sn.scrollProcessor.calculator
-                    && ('_rowHeightPx' in sn.scrollProcessor.calculator)) return sn
+                    && ('_rowHeightPx' in sn.scrollProcessor.calculator)) { _scrollComp = sn; _scrollCompAt = now; return sn }
                 fiber = fiber.return; depth++
             }
         } catch (_) {}
         return null
     }
 
-    // niconico の rowHeightPx を「安定した最小行高さ」へ単調収束させる。
-    // 値が十分ズレた時だけ再描画する（定常 forceUpdate しない＝発振・フラッシュ防止）。
-    // 成功すれば true（フォールバック不要）、内部に到達できなければ false。
-    function syncRowHeight() {
-        const comp = getScrollComponent()
-        if (!comp) return false
+    // DOM 上の最新コメント番号（窓が古い行に留まっているか＝描画ミスの判別に使う）。
+    function maxCommentNumber(el) {
+        let maxNum = 0
+        for (const n of el.querySelectorAll('.comment-number')) {
+            const v = parseInt((n.textContent || '').replace(/\D/g, ''), 10)
+            if (v > maxNum) maxNum = v
+        }
+        return maxNum
+    }
+    // 描画進捗のシグネチャ（底の高さ＋最新コメント番号）。一定時間変わらない＝描画が止まっている。
+    function renderSignature(el) {
+        return el.scrollHeight + ':' + maxCommentNumber(el)
+    }
+    // 仮想スクロールの土台 .table の padding-top(=marginTopPx) と高さを読む（診断用）。
+    function getTableMetrics(el) {
+        let marginTopPx = null, tableHeightPx = null
         try {
-            const calc = comp.scrollProcessor.calculator
-            const h = smallestRowHeight()
-            if (h <= 0) return true
-            // 観測した最小値へ「下げる方向にのみ」追従（小さい方が余白が出ず、発振もしない）
-            if (lockedRowHeight === 0 || h < lockedRowHeight - 1) lockedRowHeight = h
-            // calculator と十分ズレている時だけ書き戻して1回だけ再描画（デッドバンド6px）
-            if (Math.abs((calc._rowHeightPx || 0) - lockedRowHeight) >= 6) {
-                calc._rowHeightPx = lockedRowHeight
-                if (typeof comp.forceUpdateDeep === 'function') comp.forceUpdateDeep()
-                else if (typeof comp.forceUpdate === 'function') comp.forceUpdate()
+            const table = el.querySelector('[class*="___table___"]') || el.firstElementChild
+            if (table) {
+                const cs = getComputedStyle(table)
+                marginTopPx = Math.round(parseFloat(cs.paddingTop) || 0)
+                tableHeightPx = Math.round(parseFloat(cs.height) || table.offsetHeight || 0)
             }
-            return true
-        } catch (_) { return false }
+        } catch (_) {}
+        return { marginTopPx, tableHeightPx }
     }
 
-    // コメント欄のサイズを一瞬変える操作で niconico の ResizeObserver を発火させ、
-    // 仮想スクロールの行高さ・確保高さを再計算させる（余白の解消）。
-    // ★ fiber 補正(syncRowHeight)が使えない場合のフォールバック。
-    // 先頭へ飛ぶ副作用は forcePinLoop（底への強制追従）が相殺する。
-    function triggerRelayout() {
-        try {
-            const emotion = document.querySelector('[aria-label="エモーションパネルの開閉"]')
-            const target = emotion
-                || document.querySelector('button[aria-label="ギフト"][data-content-type="nagead"][data-target-order="1"]')
-                || document.querySelector('button[aria-label="ギフト"]')
-            if (!target) return
-            target.click()
-            setTimeout(() => { try { target.click() } catch (_) {} }, 30) // 開→閉で元に戻す
-        } catch (_) {}
+    let fzSig = '', fzSince = 0, fzAdvances = [], fzLogged = false, fzRecoverAt = -1e9, fzDetectAt = -1e9
+    // 「直前までコメントが流れていた（アクティブ）のに、追従中・最下部で描画が止まった」状態だけを
+    // 固まりとみなす（静かな配信での誤検出を避ける）。検出時は決定的な項目を記録し、スクロール運動で
+    // 描画を起こして自動回復する。
+    function freezeWatch() {
+        const el = document.querySelector('[class*="_body_"]')
+        if (!el) return
+        const now = performance.now()
+        const sig = renderSignature(el)
+        if (sig !== fzSig) {
+            // 検出後に描画が再開した＝「いつ解消したか」を記録（一過性の無風か、本物の固まりかの区別）。
+            if (fzLogged && fzDetectAt > 0) {
+                try { if (window.__crFreeze) window.__crFreeze.clearedAfterMs = Math.round(now - fzDetectAt) } catch (_) {}
+            }
+            fzSig = sig; fzSince = now; fzAdvances.push(now); fzLogged = false
+        }
+        fzAdvances = fzAdvances.filter(t => now - t < 8000)
+        const wasActive = fzAdvances.length >= 3                 // 直近8秒で複数回進んでいた
+        const atBottom = distFromBottom(el) <= NEAR_BOTTOM_PX + 6
+        const stalledMs = now - fzSince
+        if (!(following && atBottom && wasActive)) return        // アクティブ追従・最下部の時だけ判定
+
+        const comp = getScrollComponent()
+        const sp = comp && comp.scrollProcessor
+        const calc = sp && sp.calculator
+        const rh = (calc && calc._rowHeightPx) || 32
+        const rl = (calc && calc._rowsLength) || 0
+        const frame = Math.max(1, Math.ceil(el.clientHeight / rh))
+        // 仮想スクローラが描画可能な最大 scrollTop（startRowIndex を [0, rowsLength-frame] に収める上限）。
+        const maxInRangeTop = rl > 0 ? Math.max(0, (rl - frame) * rh) : (el.scrollHeight - el.clientHeight)
+        const realTop = el.scrollTop
+        const outOfRange = realTop > maxInRangeTop + 1
+        // 描画の維持は下の keep-alive ループが担うので、freezeWatch は「keep-alive が間に合わなかった
+        // 長い停止」だけを静かに記録する診断＋最終安全網（console には出さない。window.__crDebug=true で出る）。
+        // 普通のコメントの切れ目で誤発火しないよう、しきい値は高め。
+        // keep-alive 無効時(A/B検証)は素早く回復して固まりが見えるように、通常は安全網として高め。
+        const stallThreshold = outOfRange ? (window.__crNoKeepAlive ? 400 : 1500) : 4000
+        if (stalledMs <= stallThreshold) return
+
+        if (!fzLogged) {
+            fzLogged = true
+            fzDetectAt = now
+            try { (window.__crStats = window.__crStats || { kaPulse: 0, kaRescued: 0, fzFire: 0, lastRescue: null }).fzFire++ } catch (_) {}
+            const tm = getTableMetrics(el)
+            const report = {
+                t: new Date().toISOString(), stalledMs: Math.round(stalledMs),
+                distFromBottom: Math.round(distFromBottom(el)), scrollTop: Math.round(realTop),
+                scrollHeight: el.scrollHeight, clientHeight: el.clientHeight,
+                rowHeightPx: rh, rowsLength: rl,
+                fixedBottom: calc && calc._fixedBottom, isAtBottomByIO: sp && sp.isAtBottomByIO,
+                following,
+                // ↓ 反証検証で決定的とされた診断項目（次の実機固まりで機構を確定する）
+                tableRowCount: el.querySelectorAll('.table-row').length, // ~15=正常な仮想窓
+                newestInDom: maxCommentNumber(el),
+                marginTopPx: tm.marginTopPx, tableHeightPx: tm.tableHeightPx,
+                scrollHeightPxVirtual: rl > 0 ? rh * rl : null,         // 仮想高さ vs 実 scrollHeight
+                frameRowLength: frame, startRowIndexApprox: Math.floor(realTop / rh),
+                maxInRangeTop: Math.round(maxInRangeTop), outOfRange,
+                clearedAfterMs: null, recover: null,
+            }
+            try { window.__crFreeze = report } catch (_) {}
+            try { const a = (window.__crFreezes = window.__crFreezes || []); a.push(report); if (a.length > 40) a.shift() } catch (_) {}
+            try { if (window.__crDebug) console.warn('[commentresize] long stall recorded — window.__crFreeze', report) } catch (_) {}
+        }
+
+        // 最終安全網の回復（keep-alive が間に合わなかった時だけ）。見えない同期スクロール運動。
+        // __crNoSafety=true で無効化可（A/B検証で「素の固まり」を見るため）。
+        if (!window.__crNoSafety && now - fzRecoverAt > 400) {
+            fzRecoverAt = now
+            const before = sig
+            const wakeTop = Math.max(0, Math.min(realTop, maxInRangeTop) - el.clientHeight) // 一度上へ
+            selfScrollWrite(el, wakeTop)                                                     // scroll/IO を発火＝描画を起こす
+            try { if (sp && typeof sp.scrollToNewBottom === 'function') sp.scrollToNewBottom() } catch (_) {}
+            selfScrollWrite(el, el.scrollHeight)                                             // 実際の底（最新）へ戻す
+            // 回復したか（描画が前進したか）を少し後で記録。clearedAfterMs と併せて確認に使う。
+            setTimeout(() => {
+                const advanced = renderSignature(el) !== before
+                const rec = { t: new Date().toISOString(), outOfRange, wakeTop: Math.round(wakeTop), advancedAfterWake: advanced }
+                try { if (window.__crFreeze) window.__crFreeze.recover = rec } catch (_) {}
+                try { if (window.__crDebug) console.warn('[commentresize] safety recover advancedAfterWake=' + advanced, rec) } catch (_) {}
+            }, 250)
+        }
     }
 
     // 追従中は常に「真の底」へ。文字拡大で niconico のスクロールが底まで届かず
@@ -233,6 +305,7 @@
         if (el && el !== observedEl) {
             try { mo.disconnect() } catch (_) {}
             try { if (ro) ro.disconnect() } catch (_) {}
+            invalidateScrollComp()   // コンテナ差し替え＝古いコンポーネント参照を捨てる
             observedEl = el
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
@@ -243,10 +316,69 @@
             forcePinLoop()
             schedulePin()
         }
-        // niconico の rowHeightPx を実際の行高さに合わせ続ける（余白を根本から防ぐ）。
-        // 変化が無ければ何もしないので頻繁に呼んでも安全。
-        syncRowHeight()
+        // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。
+        freezeWatch()
     }
     ensureObserving()
-    setInterval(ensureObserving, 300) // 要素差し替え(リマウント)を素早く検出＋rowHeightPx同期
+    setInterval(ensureObserving, 200) // 要素差し替え(リマウント)検出＋固まり監視（素早く検出して即回復）
+
+    // ===== keep-alive: 固まりを「起こさせない」（1.2.18 / 1.2.19 で間引き）=====
+    // 固まりは outOfRange（背の高いコメントで実際の底がニコ生の仮想底を超える）の時、底センチネル/IO が
+    // 固定され、新着が来ても描画の再計算が走らないために起きる（=スクロール操作を与えるまで止まる）。
+    // そこで outOfRange・追従・最下部・非操作の間だけ描画の進捗を毎フレーム見張り、~60ms 進まなければ
+    // 「見えない同期スクロールパルス（底→上→底を1ティックで完結）」で再計算を起こす。画面は動かず最新も
+    // フル表示のまま、新着が常に即描画され続ける＝体感ゼロ停止。スムーズに流れている間はパルスを撃たない。
+    // forceUpdate/rowHeightPx は触らないので 1.2.11 のチカチカ（margin⇄補正の発振）は起きない。
+    // 1.2.19: 直近に進捗があった間だけ高頻度(100ms)・無風が続けば 600ms に間引き、無駄パルス/CPU を抑える。
+    let kaPrevSig = '', kaStaleSince = 0, kaThrottleAt = -1e9, kaProductiveAt = -1e9, kaLastPulse = -1e9
+    function keepAliveLoop() {
+        requestAnimationFrame(keepAliveLoop)
+        const now = performance.now()
+        if (now - kaThrottleAt < 30) return                 // ~33Hz 上限（過剰駆動を防ぐ）
+        kaThrottleAt = now
+        if (window.__crNoKeepAlive) return                  // A/B検証用トグル: keep-alive を無効化
+        if (!following) return                              // 追従中だけ
+        if (now - lastUserInputAt < USER_INPUT_MS) return   // ユーザー操作中はそっとしておく
+        const el = observedEl || document.querySelector('[class*="_body_"]')
+        if (!el) return
+        if (distFromBottom(el) > NEAR_BOTTOM_PX + 6) return // 最下部の時だけ
+        const comp = getScrollComponent()
+        const sp = comp && comp.scrollProcessor
+        const calc = sp && sp.calculator
+        if (!calc) return
+        const rh = calc._rowHeightPx || 32
+        const rl = calc._rowsLength || 0
+        const frame = Math.max(1, Math.ceil(el.clientHeight / rh))
+        const maxInRangeTop = rl > 0 ? Math.max(0, (rl - frame) * rh) : (el.scrollHeight - el.clientHeight)
+        if (el.scrollTop <= maxInRangeTop + 1) { kaStaleSince = now; return } // 範囲内=固まらない条件
+        const sig = renderSignature(el)
+        if (sig !== kaPrevSig) {                             // 描画が進んだ（新着が描かれた）
+            kaPrevSig = sig; kaStaleSince = now; kaProductiveAt = now; return
+        }
+        if (now - kaStaleSince < 60) return                 // まだ止まって60ms未満
+        // 直近に進捗（自然 or パルスで起こした）があった間だけ高頻度（100ms）。無風が続いたら 600ms に
+        // 間引いて無駄パルス/CPU を抑える。固まりは「進捗の直後」に起きるので、ここが速ければ取りこぼさない。
+        const minGap = (now - kaProductiveAt) < 1500 ? 100 : 600
+        if (now - kaLastPulse < minGap) return
+        kaLastPulse = now
+        const before = sig
+        const staleAtPulse = now - kaStaleSince
+        const wakeTop = Math.max(0, Math.min(el.scrollTop, maxInRangeTop) - el.clientHeight)
+        selfScrollWrite(el, wakeTop)                                          // 見えない同期パルス
+        try { if (typeof sp.scrollToNewBottom === 'function') sp.scrollToNewBottom() } catch (_) {}
+        selfScrollWrite(el, el.scrollHeight)                                 // 実際の底（最新）へ戻す
+        // 統計: パルス数と「効いたパルス」（150ms以上止まった後にパルス→直後に描画が前進）を記録。
+        try {
+            const st = (window.__crStats = window.__crStats || { kaPulse: 0, kaRescued: 0, fzFire: 0, lastRescue: null })
+            st.kaPulse++
+            if (staleAtPulse >= 150) {
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    if (renderSignature(el) !== before) {
+                        st.kaRescued++; st.lastRescue = { t: new Date().toISOString(), staleMs: Math.round(staleAtPulse) }
+                    }
+                }))
+            }
+        } catch (_) {}
+    }
+    requestAnimationFrame(keepAliveLoop)
 })()

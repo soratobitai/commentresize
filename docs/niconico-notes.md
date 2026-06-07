@@ -54,9 +54,122 @@
     それ以外（底でない＆ユーザー入力なし＝再レイアウト/undershoot）は**追従維持**し、`pinIfFollowing` が
     実際の底（実 `scrollHeight`）へ押し込む。これで誤OFFも固着も底未到達も起きない。
 
-## 仮想スクロールの行高さ（rowHeightPx）と余白の根本原因 ★最重要
+## 仮想スクロールの行高さ（rowHeightPx） ★CDP実機診断で大幅訂正
 
-nicolib.js の解析で判明した、ニコ生コメント欄の仮想スクロールの中核ロジック。
+> ⚠️ 訂正（CDP でライブ配信を実測して判明。以下の旧記述に優先する。検証: `e2e/{observe,monitor_h1,
+> probe_write,repro_rootmargin,repro_scroll,watch_freeze}.mjs`）:
+> - **`calculator._rowHeightPx` への書き込みは永続しない**。123 を書いて `forceUpdateDeep` しても ~400ms で
+>   niconico が 32 に戻す。→ 旧 `syncRowHeight`（min/median/avg いずれも）は**レイアウトに無効な no-op**。
+>   1.2.11〜1.2.13 の min/中央値論争は実は無意味だった。
+> - niconico の `rowHeightPx` は実質 **常に 32**。reserved(=32·N) は常に real(`scrollHeight`) より小さく
+>   content があふれる＝**下余白は構造的に出ない**（旧「余白＝rowHeightPx が大きすぎ」説は誤り）。
+> - **追従は sentinel/IntersectionObserver ではなく位置ベース**（`_fixedBottom`／`scrollTop≈scrollHeight`）。
+>   フォント特大で `real−reserved=−16,785px`・sentinel が画面外でも `isAtBottomByIO`/`_fixedBottom` は true の
+>   まま追従継続（`rootMargin:"0px"` でも）。→「sentinel を通り越し IO=false で固まる」説(H1)は**実機で否定**。
+> - 旧 `syncRowHeight` の唯一の実害＝**行が高いコメントの時だけ 300ms 毎に `forceUpdateDeep` を撃つ churn**
+>   （短いコメントは `|32−minRowH|<6` で不発）。これが 4 行コメント／バーストでの固まりの最有力容疑のため
+>   **1.2.14 で撤去**（以後 `forceUpdate` 系は使わない）。代わりに「直前まで流れていたのに追従中・最下部で
+>   描画停止」を検出する `freezeWatch`（記録＋niconico 自身の `scrollToNewBottom`＋pin で自己回復）を追加。
+> - 確認済み API: `scrollProcessor.{isAtBottomByIO, sentinelElement, observer, setupObserver,
+>   scrollToNewBottom, setFixedBottom}`, `calculator.{_rowHeightPx, _rowsLength, _offsetHeightPx, _fixedBottom,
+>   scrollToBottom, calculateScrollTopForRow}`, `comp.{forceUpdate, forceUpdateDeep}`。`rowsLength` は ~200 で頭打ち
+>   （ローリングウィンドウ）。
+> - 注意: 上記は CDP 実機で再現できた範囲。**固まりそのものはこの開発環境では再現できず**（passive 追従／
+>   forceUpdate 連打／特大フォント／スクロール上げ下げのいずれも固まらない）、ユーザー環境固有のトリガーが
+>   残る可能性あり。`window.__crFreeze` に最後の検出状態が入る。
+
+> ⚠️ 訂正2（実機 `window.__crFreeze` キャプチャの多視点＋反証検証。記録: 2026-06-07）:
+> 実機キャプチャ例 `{stalledMs:2696, distFromBottom:0, scrollTop:6646, scrollHeight:7106, clientHeight:460,
+> rowHeightPx:32, rowsLength:200, fixedBottom:true, isAtBottomByIO:true}` を 3 視点で分析→2 名で反証した結果:
+> - **「scrollTop が仮想座標系(rowHeightPx*rowsLength=6400)をはみ出し startRowIndex=floor(6646/32)=207>rowsLength
+>   で描画ウィンドウが行範囲外になり描画が止まる」仮説は否定された**。決定的反証: (a) `scrollHeight(7106)` は
+>   仮想高さ(6400)を**上回る**＝行は十分にマテリアライズされた背の高いリスト＝「空ウィンドウ」の正反対
+>   （空なら scrollHeight は padding だけの ~6400 以下に縮むはず）。(b) 過去のフォント1000%テストで
+>   実−仮想=−16,785px（24倍の赤字）でも固まらなかった＝8行のはみ出しでは説明不能。(c) `startRowIndex` は
+>   一度も実測しておらず式からの推測。(d) ニコ生がクランプ(`[0,rowsLength-frame]`)していれば最新行は常に窓内。
+> - **`freezeWatch` の発火条件はゆるい**（直近8秒で3進捗＋2500ms停止）。バースト直後の2.7秒の無風でも満たすため、
+>   このキャプチャ自体が「無風/一過性のリフロー」を固まりと誤検出した可能性も排除できない。
+> - **結論: 8項目スナップショットだけでは機構を特定できない**。1.2.15 で次の実機固まり用に決定的項目を追加記録:
+>   `tableRowCount`(~15=正常な仮想窓)／`newestInDom`(窓が古い行に留まるか)／`marginTopPx`・`tableHeightPx`・
+>   `scrollHeightPxVirtual` vs 実 `scrollHeight`／`outOfRange`／`following`／`clearedAfterMs`(一過性か本物か)。
+>   回復は**範囲外の時だけ**範囲内へ一度ナッジし `advancedAfterNudge`(描画再開したか)を記録＝回復処理を実験化。
+>   書き込みは `selfScrollWrite` でゲートを迂回（`following=false` 飲み込みによる自己ロックを恒久的に防止）。
+> - 次アクション: 実機で `window.__crFreeze`(と `window.__crFreezes`) を採取し、`outOfRange`/`tableRowCount`/
+>   `advancedAfterNudge`/`clearedAfterMs` で機構を確定 → 確定後に恒久修正を 1.2.16 で入れる。
+
+> ✅ 機構確定（1.2.15 実機キャプチャ3件＋ユーザー証言。記録: 2026-06-07）— **固まり＝「スクロール操作で
+> 目覚める描画停止」**。座標バグではない:
+> - 実測 `{scrollTop:6401, scrollHeight:6861, clientHeight:460, rowHeightPx:32, rowsLength:200,
+>   tableRowCount:15, marginTopPx:5920, newestInDom:31770→31860→32161, outOfRange:true, clearedAfterMs:~300}`。
+> - **`tableRowCount:15`＋`marginTopPx:5920(=185*32)`＝ニコ生は `startRowIndex` を 185 にクランプし末尾15行
+>   （最新含む）を正常描画**。`newestInDom` もキャプチャ間で前進＝行範囲外/空ウィンドウ説は実測で完全否定。
+>   `outOfRange:true`（scrollTop>仮想底5920）は**無害な見かけだけ**。→ ワークフロー設計案の「pin を範囲内へ
+>   クランプ」修正は最新を切るだけで無意味と判明（測ってから直して正解）。
+> - **正体は時間的な描画停止**: 背の高い折り返しコメント直後にニコ生の描画が止まり、新着データだけでは
+>   再開せず「**スクロール操作を与えるまで固まったまま**」（ユーザー証言:「一度止まると操作するまで戻らない」）。
+>   ユーザーが手動スクロールで復帰していたのはこのため。
+> - **回復の有効成分＝スクロール運動**: 1.2.14（`scrollToNewBottom`+pin、運動なし）は回復せず、1.2.15 で
+>   底→上(5460)→底 の programmatic なスクロール運動を入れて**初めて自動回復**（ユーザー:「回復したのは初めて／
+>   以前より明確に良くなった」）。`advancedAfterNudge:false` は計測が早すぎ(2フレーム)ただけで、`clearedAfterMs:~300`
+>   が実際の回復を示す（回復は検出後~300msで起きる）。
+> - **1.2.16 で確定修正**: 回復を「outOfRange に関係なく」スクロール運動（底→上→底）で発火するよう一般化。
+>   1.2.15 の弱点だった (a)outOfRange ゲート (b)ナッジ直後の `scrollToNewBottom` による計測汚染 を解消。
+>   `selfScrollWrite` で全書き込みがゲートを迂回（`following=false` 飲み込みの自己ロックを恒久防止）。
+> - **未解明（実害は回復済み）**: 描画停止そのものの内部原因（IO/スクロール駆動の描画フラッシュが背の高い行で
+>   詰まる等）は未特定だが、スクロール運動で確実に起こせるため実用上は解決。
+
+> 🎯 1.2.17 — 「見切れゼロのまま体感停止をなくす」方針（ユーザー要望「止まってほしくない／見切れも困る」）:
+> - **位置クランプ（scrollTop をニコ生の仮想底 maxInRangeTop まで下げる）は不採用**。実コンテンツは仮想底の
+>   数百px下にあるため、クランプすると最新コメントが**画面外に隠れる**（見切れどころか見えない）＝逆効果。
+> - 採用: **位置は実際の底のまま（最新フル表示）**、固まりやすい `outOfRange` の時だけ検出を素早くして
+>   （しきい値 `outOfRange?400:2500`ms、ポーリング 300→**200ms**、回復スロットル 1500→**400ms**）
+>   1.2.15/1.2.16 で確定した**同期スクロール運動**（底→上→底を1ティック内で完結＝画面は動いて見えない）で
+>   即回復。これで見切れゼロ・体感停止ほぼ無し（~3s → ≤~0.5s）。
+> - 高速ポーリングで毎回 fiber を辿らないよう `getScrollComponent` に2秒キャッシュ（コンテナ差し替え時は
+>   `invalidateScrollComp` で破棄）。`window.__crFreezes` は直近40件に制限。
+> - 仮説（未確証）: 描画停止のトリガーは「scrollTop が仮想底を超える(outOfRange)と底センチネル/IO が固定され
+>   新着で再計算が走らない」こと。だから outOfRange を高速回復の発火条件にしている。さらに詰める場合は、
+>   `outOfRange` 中に微小な同期運動を**継続**して撃つ keep-alive（完全無停止狙い、churn 増）も可能。
+>   逆に体感が十分なら据え置き。停止の内部機構の確定には、固まり中の「モデル最新番号 vs DOM最新番号」採取が必要。
+
+> 🚀 1.2.18 — keep-alive（固まりを起こさせない）。ユーザー要望「0.5秒も嫌、完全に止めたくない」:
+> - `outOfRange`・追従・最下部・非操作（`lastUserInputAt` から `USER_INPUT_MS` 経過）の間だけ、`requestAnimationFrame`
+>   ループ（~33Hz 上限）で描画進捗（`renderSignature`）を見張り、**~60ms 進まなければ見えない同期スクロール
+>   パルス（底→上→底を1ティック完結＝画面は動かない）**で再計算を起こす。新着が常に即描画され続け、止まる隙を
+>   与えない（~3s → 0）。スムーズに流れている間（60ms 以内に進捗）はパルスを撃たない＝無駄な負荷なし。
+> - 位置は実際の底のまま＝**最新フル表示・見切れゼロ**。`forceUpdate`/`_rowHeightPx` は触らないので 1.2.11 の
+>   チカチカ（margin⇄補正の発振）は原理的に起きない（パルスは毎回同じ底位置で完結＝可視状態が変化しない）。
+> - 1.2.17 の高速 freezeWatch（`outOfRange?400:2500`ms）は**安全網**として併存。keep-alive が効いていれば
+>   `renderSignature` が進み続けるので freezeWatch は発火しない＝`window.__crFreeze` が残ったら keep-alive 失敗の証拠。
+> - ユーザー操作（wheel/touch/key）中は keep-alive を止めるので、上スクロールでの履歴閲覧は妨げない。
+> - 観察ポイント（実機）: チカチカ／CPU 過負荷／上スクロール阻害が無いか。あれば throttle(30ms)・stale(60ms) を緩める。
+
+> 🔇 1.2.19 — ログ静音化＋無駄パルス間引き（実機で「__crFreeze/scroll-wake のログが連続して出続ける」報告を受けて）:
+> - 原因: `freezeWatch`(1.2.17 安全網, しきい値 `outOfRange?400:2500`ms)は「無風（コメントの切れ目）」と「本物の固まり」を
+>   区別できず、賑やかな配信でも 0.4s 以上の切れ目ごとに detect+recover を console.warn していた（実害なし＝画面は止まって
+>   いない／パルスは空振り、だが煩い＋無駄 CPU）。
+> - 対策: (1) 全 console.warn を **`window.__crDebug=true` の時だけ**出すよう静音化（既定オフ）。(2) `freezeWatch` のしきい値を
+>   **`outOfRange?1500:4000`ms** に上げ「keep-alive が間に合わなかった長い停止」だけを静かに記録する最終安全網に格下げ。
+>   (3) keep-alive は **直近進捗<1500ms なら 100ms / それ以外 600ms** に pulse を間引き（`kaProductiveAt`/`kaLastPulse`）。
+>   固まりは「進捗の直後」に起きるので、進捗直後だけ高頻度なら取りこぼさない。体感(止まらない・見切れない)は 1.2.18 と同じ。
+> - 学び: `renderSignature`(scrollHeight+最大番号)の静止は「固まり」と「無風」を区別できない（反証パスの指摘どおり）。
+>   厳密に区別するには固まり中の「モデル最新番号 vs DOM最新番号」採取が必要（未実施）。今は productive ベースの間引きで近似。
+
+> 🧪 1.2.20 — keep-alive の効果を確認する検証ツール（ユーザー指摘「keep-alive が効いているか未確認／効くなら scroll-wake は不要」）:
+> - 重要な認識: keep-alive が速く(100ms)叩くため停止が育つ前に消え、ログだけでは「本物の固まりを防いだ」のか
+>   「そもそも固まっていない（切れ目）」のか区別できない。**確認には A/B（keep-alive を切って固まりが戻るか）が必要**。
+> - 追加トグル（コンソールで設定）: `window.__crNoKeepAlive=true` で keep-alive 無効化（この時 freezeWatch しきい値は
+>   400ms に下がり素早く回復＝固まりが短く見える）。`window.__crNoSafety=true` で freezeWatch の回復も無効化
+>   （両方 true＝素のニコ生＝固まりが操作するまで戻らない元の症状を再現）。
+> - 追加カウンタ `window.__crStats = { kaPulse, kaRescued, fzFire, lastRescue }`: kaPulse=keep-alive パルス総数、
+>   kaRescued=「150ms以上止まった後にパルス→直後に描画が前進」した回数（＝本物の固まりを keep-alive が救った近似値）、
+>   fzFire=安全網 freezeWatch が発火した回数（＝keep-alive が取りこぼした回数）。
+> - 判定: 賑やか配信で数分視聴し、(A) 通常(keep-alive ON)で `kaRescued>0 かつ fzFire≈0` なら keep-alive が固まりを
+>   実際に防いでいる証拠＝scroll-wake は削除可。(B) `__crNoKeepAlive=true` にして固まり（短い引っかかり）が出る/`fzFire` が
+>   増えるなら、keep-alive が効いていた裏付け。(C) ON でも `kaRescued=0` のままなら、そもそも固まりが発生していない可能性。
+> - 次アクション: A/B 結果しだいで scroll-wake(freezeWatch 回復)を削除して keep-alive 一本化、または keep-alive のパラメータ調整。
+
+以下は nicolib.js の静的解析メモ（歴史的経緯。結論は上記訂正が優先する）。
 
 - 仮想スクロールは `calculator`（minified class `b`）が **単一の固定 `rowHeightPx`** で全行を扱う：
   - `scrollHeightPx = rowHeightPx * rowsLength`（全体の高さ）
