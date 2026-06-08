@@ -139,6 +139,7 @@
         fpRaf = 0
         const el = document.querySelector('[class*="_body_"]')
         if (el) pinToBottom(el)
+        blankFixWatch()   // 余白の高速検知: クリック/リマウント直後の rAF 密ウィンドウで即修正（throttle/settle/cooldown で暴発防止）
         if (performance.now() < forcePinUntil) fpRaf = requestAnimationFrame(forcePinLoop)
     }
     function startForcePin() { if (!fpRaf) forcePinLoop() }
@@ -310,6 +311,149 @@
         if (el && distFromBottom(el) > 0) pinToBottom(el)
     }
 
+    // ===== 下余白の修正（エモーション・トグルでリマウント→niconico に rowHeightPx を再計測させる）=====
+    // 実機調査(2026-06, e2e の CDP プローブ)で機構を確認:
+    //  - エモーションパネルの開閉はコメント欄を破棄→再生成（リマウント）する（_body_/calculator/sentinel の
+    //    identity がすべて入れ替わる。トグル中は一瞬 _body_ が DOM から消える）。
+    //  - 余白は rowHeightPx が実行行高より大きい時に出る（frame=ceil(clientHeight/rowHeightPx) が過小で末尾窓が
+    //    ビューポートを埋めきれない）。rowHeightPx はコンポーネントがマウント時に1回測る値で、その場で測り直す
+    //    内部メソッドは無い（calculator に measure/initialized 系が無い）。だから再計測にはリマウントが要る。
+    //  - リマウントで rowHeightPx が小さく測り直されれば frame が増え余白が閉じる（ユーザー実体験で有効）。
+    //    先頭飛びは既存の forcePin がフレーム0から吸収する（実機で distFromBottom=0 維持を確認）。
+    // ★既定ON（2026-06-08 実機で `rowHeightBefore65→After32 / blank176→0 / +1.5s維持 / 発火1回` を確認し採用）。
+    //   無効化は window.__crNoReviveBlank=true。過剰なリマウントを避けるため
+    //   「最下部・操作なし・rowHeightPx>実行平均×1.15・余白>60px が ~600ms 定常」の時だけ1回（クールダウン付き）。
+    //   記録: window.__crBlankFix に before/after(rowHeightPx, blankPx)、window.__crStats.blankFix に回数。
+    const REVIVE_RATIO = 1.15        // rowHeightPx が実行平均のこの倍率超＝frame 過小の余白条件
+    const REVIVE_BLANK_PX = 60       // この px 超の余白がある時だけ
+    const REVIVE_SETTLE_MS = 100     // 余白条件がこの時間連続＝定常。rh>avg 述語で一過性 catch-up は元々除外、これは1フレーム glitch 除け（短く＝即回復）
+    const REVIVE_COOLDOWN_MS = 3000  // 1回直してから次まで最低この間隔（暴発防止）
+    const BLANK_MEASURE_MIN_MS = 50  // rect 計測の最小間隔（rAF 高頻度呼びでも最大~20/sec に絞る）
+    const REVIVE_MAX_FAILS = 2       // リマウントが効かない配信で連続失敗がこの数に達したら停止（無限ループ防止。新規マウントで再アーム）
+    let reviveBlankSince = 0, reviveLastAt = -1e9, emoBusy = false, lastBlankMeasureAt = -1e9
+    let reviveFailStreak = 0, lastEmoRemountAt = -1e9
+
+    // 最下部の余白量と実行行高の平均を測る。blankPx = scrollHeight −（見た目で一番下の行の content 座標下端）。
+    function measureBlank(el) {
+        const rows = el.querySelectorAll('.table-row')
+        if (!rows.length) return null
+        const bodyRect = el.getBoundingClientRect()
+        const bodyTop = bodyRect.top + el.clientTop
+        let lastBottom = -Infinity, sum = 0, n = 0
+        for (let i = 0; i < rows.length; i++) {
+            const r = rows[i].getBoundingClientRect()
+            if (r.bottom > lastBottom) lastBottom = r.bottom
+            if (r.height > 0) { sum += r.height; n++ }
+        }
+        if (!n) return null
+        const blankPx = Math.round(el.scrollHeight - ((lastBottom - bodyTop) + el.scrollTop))
+        return { blankPx, avgRow: sum / n }
+    }
+
+    // 余白が「rowHeightPx 過大による定常 under-fill」の時だけ、エモーション・トグルでリマウントさせる。
+    function blankFixWatch() {
+        if (window.__crNoReviveBlank) { reviveBlankSince = 0; return }  // 既定ON。__crNoReviveBlank=true で無効化
+        if (emoBusy) return
+        if (document.hidden) { reviveBlankSince = 0; return }           // 非表示タブでは不要（rAF停止中＝後始末漏れも防ぐ）
+        if (reviveFailStreak >= REVIVE_MAX_FAILS) { reviveBlankSince = 0; return }  // 効かない配信で無限リマウントしない（新規マウントで再アーム）
+        const el = observedEl || document.querySelector('[class*="_body_"]')
+        if (!el) { reviveBlankSince = 0; return }
+        const now = performance.now()
+        if (!following) { reviveBlankSince = 0; return }
+        if (distFromBottom(el) > NEAR_BOTTOM_PX + 6) { reviveBlankSince = 0; return }  // 最下部だけ
+        if (now - lastUserInputAt < USER_INPUT_MS) { reviveBlankSince = 0; return }    // 操作中は触らない
+        try { if (isTypingTarget(document.activeElement)) { reviveBlankSince = 0; return } } catch (_) {}
+        const comp = getScrollComponent()
+        const calc = comp && comp.scrollProcessor && comp.scrollProcessor.calculator
+        if (!calc) { reviveBlankSince = 0; return }
+        const rh = calc._rowHeightPx || 32
+        if (rh <= 36) { reviveBlankSince = 0; return }   // 素の行高(=膨張なし)＝余白は出ない。重い rect 計測を省く（既定ONの常時コスト対策）
+        if (now - lastBlankMeasureAt < BLANK_MEASURE_MIN_MS) return   // rect 計測の頻度を絞る（rAF 連打対策。settle タイマーは保持）
+        lastBlankMeasureAt = now
+        const m = measureBlank(el)
+        if (!m) { reviveBlankSince = 0; return }
+        const qualifies = (rh > m.avgRow * REVIVE_RATIO) && (m.blankPx > REVIVE_BLANK_PX)
+        if (!qualifies) { reviveBlankSince = 0; return }
+        if (!reviveBlankSince) { reviveBlankSince = now; return }       // 定常確認の開始
+        if (now - reviveBlankSince < REVIVE_SETTLE_MS) return           // まだ定常でない
+        if (now - reviveLastAt < REVIVE_COOLDOWN_MS) return             // クールダウン
+        reviveLastAt = now; reviveBlankSince = 0
+        const fired = emotionRemount({ rowHeightBefore: rh, blankBefore: m.blankPx, avgRow: Math.round(m.avgRow) })
+        if (!fired) reviveFailStreak++   // ボタンが無い等で実行不可＝再試行は無駄なのでバックオフ（新規マウントで再アーム）
+    }
+
+    // リマウント用ボタン: パネルを2回トグル（開→閉）してコメント欄を破棄→再生成＝niconico に rowHeightPx を
+    // 再計測させる。放送設定でエモーションが無効だとボタンが無いため、ギフトボタンを代替に使う
+    // （実機確認: ギフトのトグルも同様にコメント欄をリマウントする）。両方無ければ実行不可（return false）。
+    const REMOUNT_BUTTONS = [
+        { sel: '[aria-label="エモーションパネルの開閉"]', kind: 'emotion' },
+        { sel: '[aria-label="ギフト"]', kind: 'gift' },
+    ]
+    function findRemountButton() {
+        for (const b of REMOUNT_BUTTONS) { const el = document.querySelector(b.sel); if (el) return { el, kind: b.kind } }
+        return null
+    }
+    function emotionRemount(info) {
+        const found = findRemountButton()
+        if (!found) return false                 // エモーションもギフトも無い放送＝実行不可（無害にスキップ）
+        const btn = found.el
+        emoBusy = true
+        lastEmoRemountAt = performance.now()     // 自分のリマウントを ensureObserving の再アーム判定で除外するため
+        const prevFocus = document.activeElement
+        // 開閉アニメのチラつき低減（パネルclassは環境依存のため transition/animation を一時停止）。
+        const st = document.createElement('style')
+        st.textContent = '*{transition:none!important;animation:none!important}'
+        try { document.head.appendChild(st) } catch (_) {}
+        // rAF が背景タブで飢餓しても emoBusy/style が残らないよう、必ず後始末する（重複呼びは cleaned で無害）。
+        let cleaned = false
+        const cleanup = () => { if (cleaned) return; cleaned = true; try { st.remove() } catch (_) {} emoBusy = false }
+        const watchdog = setTimeout(cleanup, 2000)
+        // リマウントの先頭飛びを forcePin で吸収（コンテナ差し替えは ensureObserving も検出する）。
+        setFollowing(true)
+        forcePinUntil = performance.now() + FORCE_PIN_MS
+        startForcePin()
+        try { (window.__crStats = window.__crStats || {}).blankFix = ((window.__crStats.blankFix || 0) + 1) } catch (_) {}
+        try { btn.click() } catch (_) {}            // 開く
+        requestAnimationFrame(() => {
+            try { btn.click() } catch (_) {}        // 次フレームで閉じる（開きを commit＝リマウント）
+            // フォーカスは閉じた直後に戻す（260ms 駐留中の打鍵がボタンへ誤爆しないように）。
+            try { if (prevFocus && typeof prevFocus.focus === 'function' && !isTypingTarget(document.activeElement)) prevFocus.focus({ preventScroll: true }) } catch (_) {}
+            setTimeout(() => {
+                clearTimeout(watchdog); cleanup()   // style 除去＋emoBusy 解放
+                // リマウント後の rowHeightPx 再計測結果と余白を記録（before/after で検証）。
+                invalidateScrollComp()
+                const el2 = document.querySelector('[class*="_body_"]')
+                const comp2 = getScrollComponent()
+                const calc2 = comp2 && comp2.scrollProcessor && comp2.scrollProcessor.calculator
+                const m2 = el2 ? measureBlank(el2) : null
+                const rec = {
+                    t: new Date().toISOString(), method: found.kind,
+                    rowHeightBefore: info.rowHeightBefore, rowHeightAfter: calc2 ? calc2._rowHeightPx : null,
+                    blankBefore: info.blankBefore, blankAfter: (m2 ? m2.blankPx : null), avgRow: info.avgRow,
+                    rowHeightAt1500: null, blankAt1500: null,
+                }
+                try { window.__crBlankFix = rec } catch (_) {}
+                try { if (window.__crDebug) console.warn('[commentresize] blank revive (' + found.kind + ' remount)', rec) } catch (_) {}
+                forcePinUntil = Math.max(forcePinUntil, performance.now() + 400)
+                startForcePin()
+                // 効果判定: +1.5s 後に rowHeightPx が下がっていなければ「効かない配信」とみなし失敗カウント。
+                // REVIVE_MAX_FAILS に達したら blankFixWatch が停止（無限リマウント防止）。効いたらリセット。
+                setTimeout(() => {
+                    invalidateScrollComp()
+                    const el3 = document.querySelector('[class*="_body_"]')
+                    const c3 = getScrollComponent()
+                    const calc3 = c3 && c3.scrollProcessor && c3.scrollProcessor.calculator
+                    const rh3 = calc3 ? calc3._rowHeightPx : null
+                    const m3 = el3 ? measureBlank(el3) : null
+                    try { if (window.__crBlankFix === rec) { rec.rowHeightAt1500 = rh3; rec.blankAt1500 = m3 ? m3.blankPx : null } } catch (_) {}
+                    if (rh3 != null && rh3 > 36) reviveFailStreak++   // 効かなかった（まだ膨張したまま）
+                    else reviveFailStreak = 0                         // 効いた（素の値へ）＝リセット
+                }, 1500)
+            }, 260)
+        })
+        return true
+    }
+
     // コメント追加・レイアウト変化（フォントサイズ変更など）で底へ追従させる
     let rafId = 0
     const schedulePin = () => {
@@ -329,6 +473,8 @@
             try { mo.disconnect() } catch (_) {}
             try { if (ro) ro.disconnect() } catch (_) {}
             invalidateScrollComp()   // コンテナ差し替え＝古いコンポーネント参照を捨てる
+            // 自分のリマウント以外（=ニコ生由来の新規マウント: SPA遷移/エモーション復帰等）なら余白修正の失敗カウントを再アーム
+            if (performance.now() - lastEmoRemountAt > REVIVE_COOLDOWN_MS) reviveFailStreak = 0
             observedEl = el
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
@@ -341,6 +487,7 @@
         }
         // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。
         freezeWatch()
+        blankFixWatch()   // 下余白の修正（既定ON。window.__crNoReviveBlank=true で無効）。
     }
     ensureObserving()
     setInterval(ensureObserving, 200) // 要素差し替え(リマウント)検出＋固まり監視（素早く検出して即回復）
