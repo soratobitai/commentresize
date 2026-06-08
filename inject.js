@@ -23,6 +23,10 @@
 (function () {
     'use strict'
 
+    // 二重注入ガード：同一realmで2回走ると prototype を二重ラップし、ループ/リスナーが二重化する。
+    if (window.__crInjected) return
+    window.__crInjected = true
+
     const NEAR_BOTTOM_PX = 8 // これ以下なら「底にいる＝追従」とみなす
     const FORCE_PIN_MS = 1500 // 「最新コメントに戻る」後、この間は追従を外さず底へ貼り付ける
     let following = true     // 底に追従中か（初期は追従）
@@ -84,9 +88,21 @@
     const USER_INPUT_MS = 300 // この時間内のユーザー入力を「ユーザー操作中」とみなす
     let lastUserInputAt = -1e9
     const markUserInput = () => { lastUserInputAt = performance.now() }
-    for (const type of ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown']) {
+    // コメント入力欄でのキー入力は「スクロール意図」ではない → これを拾うと、入力中に折り返しコメントが
+    // 届いた際の再レイアウト scroll を「ユーザー操作」と誤認して追従を外し、底へ戻らなくなる。
+    // INPUT/TEXTAREA/SELECT/編集可能領域上の keydown は除外する。
+    const isTypingTarget = (t) => {
+        if (!t || t.nodeType !== 1) return false
+        const tag = t.tagName
+        return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true
+    }
+    for (const type of ['wheel', 'touchstart', 'touchmove', 'pointerdown']) {
         document.addEventListener(type, markUserInput, { capture: true, passive: true })
     }
+    // keydown だけは入力欄を除外（PageUp/Down・矢印・スペース等のスクロール意図は引き続き拾う）。
+    document.addEventListener('keydown', (e) => {
+        if (!isTypingTarget(e.target)) markUserInput()
+    }, { capture: true, passive: true })
 
     document.addEventListener('scroll', (e) => {
         const el = e.target
@@ -111,16 +127,21 @@
             // 追従ONにし、再描画が落ち着くまで強制的に底へ貼り付ける（先頭飛び・余白対策）
             setFollowing(true)
             forcePinUntil = performance.now() + FORCE_PIN_MS
-            forcePinLoop()
+            startForcePin()
         }
     }, { capture: true })
 
-    // 強制追従ウィンドウの間、毎フレーム底へ貼り付けて niconico を底レイアウトへ収束させる
+    // 強制追従ウィンドウの間、毎フレーム底へ貼り付けて niconico を底レイアウトへ収束させる。
+    // fpRaf で1本に保ち、クリック連打や連続リマウントで rAF 鎖が多重化するのを防ぐ
+    // （呼び出し側は forcePinUntil を延長してから startForcePin を呼ぶ＝既存の鎖が長く回るだけ）。
+    let fpRaf = 0
     function forcePinLoop() {
+        fpRaf = 0
         const el = document.querySelector('[class*="_body_"]')
         if (el) pinToBottom(el)
-        if (performance.now() < forcePinUntil) requestAnimationFrame(forcePinLoop)
+        if (performance.now() < forcePinUntil) fpRaf = requestAnimationFrame(forcePinLoop)
     }
+    function startForcePin() { if (!fpRaf) forcePinLoop() }
 
     // ===== 固まり（フリーズ）の検出と回復（1.2.17）=====
     // 実機 window.__crFreeze の多視点＋反証検証で機構が確定した:
@@ -202,7 +223,9 @@
     function freezeWatch() {
         const el = document.querySelector('[class*="_body_"]')
         if (!el) return
+        if (document.hidden) return                          // 非表示タブでは固まり監視も回復も不要（毎200msのDOM走査を省く）
         const now = performance.now()
+        if (!following) { fzSig = ''; return }               // 上スクロール閲覧中は固まり判定しない＝無駄走査を省く（追従再開時に再ウォームアップ）
         const sig = renderSignature(el)
         if (sig !== fzSig) {
             // 検出後に描画が再開した＝「いつ解消したか」を記録（一過性の無風か、本物の固まりかの区別）。
@@ -313,7 +336,7 @@
             // 最新へ追従し、内容が確定するまで底へ強制追従して「最新が見えない」を防ぐ。
             setFollowing(true)
             forcePinUntil = performance.now() + FORCE_PIN_MS
-            forcePinLoop()
+            startForcePin()
             schedulePin()
         }
         // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。

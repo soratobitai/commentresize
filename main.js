@@ -18,11 +18,15 @@ let contentsTabPanelObserver = null // contents-tab-panel監視用Observer
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
+let fullscreenRetryTimeout = null // フルスクリーン監視の再試行タイマー（cleanupで解除）
+let rootTargetNode = null // ルート要素(#root)。リマウント時のUI再注入に使う
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
 // 底追従・自動スクロールは inject.js(メインワールド)が担当する
 let sortDebounceTimer = null // コメント並べ替えのデバウンス用タイマー
 let sortScrollHandler = null // 並べ替えトリガ用スクロールハンドラ参照（remove用）
 const SORT_IDLE_MS = 250 // スクロールがこの時間止まったら1回だけ並べ替える
+// 保存値のサニタイズ：フォントサイズは 50–300% の数値文字列に正規化（不正値が innerHTML/CSS へ流れるのを防ぐ）
+const clampPct = (v) => Math.min(300, Math.max(50, parseInt(v, 10) || 100)) + '%'
 
 document.addEventListener('DOMContentLoaded', () => {
 
@@ -38,8 +42,8 @@ document.addEventListener('DOMContentLoaded', () => {
             // デフォルト値を使用
         }
 
-        commentNumberFontSize = result.commentNumberFontSize || defaultCommentNumberFontSize
-        commentTextFontSize = result.commentTextFontSize || defaultCommentTextFontSize
+        commentNumberFontSize = clampPct(result.commentNumberFontSize)
+        commentTextFontSize = clampPct(result.commentTextFontSize)
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
         isExtensionEnabled = (typeof result.isExtensionEnabled === 'boolean') ? result.isExtensionEnabled : defaultIsExtensionEnabled
 
@@ -145,6 +149,8 @@ function enableExtensionTemporarily() {
 
     // 既存のコメントに弾幕判定を適用
     processComments()
+    // リマウントで失われた設定UI（Aaボタン/パネル）を必要なら貼り直す（冪等）
+    ensureSettingsUi()
     // 底追従とスクロールは inject.js(メインワールド)が担当する
 }
 
@@ -302,6 +308,7 @@ function scheduleInitialization(targetNode) {
  * アプリケーションの初期化
  */
 function initializeApp(targetNode) {
+    rootTargetNode = targetNode // リマウント時のUI再注入に使う
     // CSSスタイルルールを作成
     createCommentStyles()
 
@@ -386,6 +393,10 @@ function cleanupResources() {
         clearTimeout(sortDebounceTimer)
         sortDebounceTimer = null
     }
+    if (fullscreenRetryTimeout) {
+        clearTimeout(fullscreenRetryTimeout)
+        fullscreenRetryTimeout = null
+    }
 
     // 並べ替えトリガのスクロールリスナーを外す
     if (sortScrollHandler) {
@@ -429,6 +440,7 @@ function insertSettingPanel(targetNode) {
         // console.warn('addon-controller要素が見つかりません')
         return
     }
+    if (addonController.querySelector('.setting-container')) return // 既に存在（冪等：二重注入防止）
 
     const sliderContainer = document.createElement('div')
     sliderContainer.classList.add('setting-container') // 設定画面の表示/非表示用にクラスを追加
@@ -678,13 +690,23 @@ function insertToggleButton() {
     }
 }
 
+// リマウント（エモーション復帰/タブ切替/SPA遷移）で addon-controller が作り直されると、CSS は
+// enableExtensionTemporarily で復活するが設定UI（Aaボタン/パネル）は孤児化して「設定が開けない」。
+// 挿入関数は両方とも冪等なので、不在の時だけ貼り直す。
+function ensureSettingsUi() {
+    const addonController = document.querySelector('.addon-controller')
+    if (!addonController) return
+    if (!addonController.querySelector('.option-button')) insertToggleButton()
+    if (!addonController.querySelector('.setting-container')) insertSettingPanel(rootTargetNode)
+}
+
 // 設定パネル外クリックで閉じる
 function handleOutsideClick(event) {
     const sliderContainer = document.querySelector('.setting-container')
     if (!sliderContainer) return
     const optionButton = document.querySelector('.option-button')
-    // パネル内またはAaボタン自体をクリックした場合は閉じない
-    if (sliderContainer.contains(event.target) || optionButton.contains(event.target)) return
+    // パネル内またはAaボタン自体をクリックした場合は閉じない（ボタンが消えている場合も考慮しnullガード）
+    if (sliderContainer.contains(event.target) || (optionButton && optionButton.contains(event.target))) return
     sliderContainer.style.display = 'none'
     document.removeEventListener('mousedown', handleOutsideClick)
 }
@@ -741,10 +763,17 @@ function sortCommentRows() {
             return Number.isFinite(n) ? n : null
         }
 
+        // 対象は1コンテナ分だけにスコープ（リマウントで旧コンテナが一時併存しても、別コンテナの
+        // 行をこの親へ移動させて混線させない）。
+        const parent = rows[0].parentElement
+        if (!parent) return
+        const scoped = rows.filter((r) => r.parentElement === parent)
+        if (scoped.length < 2) return
+
         // 既に番号昇順なら並べ替え不要（DOMを触らない）
         let alreadySorted = true
         let prev = null
-        for (const row of rows) {
+        for (const row of scoped) {
             const n = numberOf(row)
             if (n == null) continue // 番号の無い行（運営コメント等）は順序判定から除外
             if (prev != null && n < prev) { alreadySorted = false; break }
@@ -752,11 +781,8 @@ function sortCommentRows() {
         }
         if (alreadySorted) return
 
-        const parent = rows[0].parentElement
-        if (!parent) return
-
         // 番号で安定ソート（番号が無い行は元の相対位置を保つ）
-        const ordered = rows
+        const ordered = scoped
             .map((row, index) => ({ row, index, n: numberOf(row) }))
             .sort((a, b) => (a.n == null || b.n == null) ? a.index - b.index : a.n - b.n)
             .map((o) => o.row)
@@ -925,13 +951,13 @@ function isDanmakuComment(comment) {
 // フルスクリーン時にボタン非表示
 function watchFullscreenChange() {
     try {
+        // 前回の再試行タイマーが残っていれば解除（多重スケジュール防止）
+        if (fullscreenRetryTimeout) { clearTimeout(fullscreenRetryTimeout); fullscreenRetryTimeout = null }
         const optionButton = document.getElementsByClassName('option-button')[0]
 
         if (!optionButton) {
-            // option-button要素が見つからない場合は、少し遅延して再試行
-            setTimeout(() => {
-                watchFullscreenChange()
-            }, 1000)
+            // option-button要素が見つからない場合は、少し遅延して再試行（cleanupで解除できるよう追跡）
+            fullscreenRetryTimeout = setTimeout(watchFullscreenChange, 1000)
             return
         }
 
@@ -976,6 +1002,12 @@ function watchFullscreenChange() {
             }
         }
 
+        // 既存のリスナーがあれば外してから張り直す（成功パスが複数回走った時の二重登録を防ぐ）
+        if (fullscreenCheckFunction) {
+            document.removeEventListener('fullscreenchange', fullscreenCheckFunction)
+            document.removeEventListener('webkitfullscreenchange', fullscreenCheckFunction)
+            document.removeEventListener('mozfullscreenchange', fullscreenCheckFunction)
+        }
         // グローバル変数に保存（クリーンアップ用）
         fullscreenCheckFunction = checkFullscreen
 
@@ -987,10 +1019,8 @@ function watchFullscreenChange() {
         // 監視対象の要素を取得
         const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
         if (elements.length === 0) {
-            // 監視対象が見つからない場合は、少し遅延して再試行
-            setTimeout(() => {
-                watchFullscreenChange()
-            }, 2000)
+            // 監視対象が見つからない場合は、少し遅延して再試行（cleanupで解除できるよう追跡）
+            fullscreenRetryTimeout = setTimeout(watchFullscreenChange, 2000)
             return
         }
 

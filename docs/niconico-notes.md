@@ -63,6 +63,9 @@
 >   1.2.11〜1.2.13 の min/中央値論争は実は無意味だった。
 > - niconico の `rowHeightPx` は実質 **常に 32**。reserved(=32·N) は常に real(`scrollHeight`) より小さく
 >   content があふれる＝**下余白は構造的に出ない**（旧「余白＝rowHeightPx が大きすぎ」説は誤り）。
+>   ※**2026-06-08 訂正**: これは当該検証配信限定。文字拡大＋折り返しの実利用では niconico 自身が
+>   `rowHeightPx` を高く確定する（実機キャプチャで **62**、`scrollHeight=62*186`）。その時 `frame=ceil(460/62)=8`
+>   で末尾窓が under-fill し**下余白は出る**。詳細は下記「下余白（ボトムブランク）」節（実機確定）。
 > - **追従は sentinel/IntersectionObserver ではなく位置ベース**（`_fixedBottom`／`scrollTop≈scrollHeight`）。
 >   フォント特大で `real−reserved=−16,785px`・sentinel が画面外でも `isAtBottomByIO`/`_fixedBottom` は true の
 >   まま追従継続（`rootMargin:"0px"` でも）。→「sentinel を通り越し IO=false で固まる」説(H1)は**実機で否定**。
@@ -185,13 +188,14 @@
 - **1.2.5 のエモーションパネル2回トグルが効いた理由**: トグルでコメント欄が破棄→再生成（リマウント）され、
   `rowHeightPx` が再計測されるため。ただしUIハックで、先頭飛び等の副作用があった（1.2.6 で撤去→余白再発）。
 
-### 根本対策（`inject.js`）
-- `.table-row` の React fiber を上方向に辿り、`scrollProcessor.calculator`（`_rowHeightPx` を持つ）に到達。
-  （`__reactFiber$...` キー → `fiber.return` を辿る。`stateNode` がコンポーネント実体で `forceUpdateDeep` も持つ）
-- `calculator._rowHeightPx` を実際の行高さへ同期し、必要時のみ `forceUpdateDeep()`/`forceUpdate()` で再描画
-  （`syncRowHeight`）。リマウント検出時＋「最新コメントに戻る」時＋300ms毎に実行。
-- fiber/内部名に到達できない（ニコ生更新で minified 名が変わる等）場合は **エモーショントグル（`triggerRelayout`）に
-  自動フォールバック**するので退行しない。
+### 行高さ同期は撤去済み（1.2.14）— 現 `inject.js` は `_rowHeightPx` を書かない ⚠️訂正
+- **旧実装（撤去済み）**: `.table-row` の React fiber を辿って `scrollProcessor.calculator._rowHeightPx` を実高さへ同期し
+  `forceUpdateDeep()`/`forceUpdate()` で再描画（`syncRowHeight`、リマウント時＋「最新に戻る」時＋300ms毎）。
+  これは **1.2.14 で撤去**（チカチカ＝自励発振の原因で効果も薄い。本書「rowHeightPx」節・「1.2.11 発振」節参照）。
+  `triggerRelayout`（エモーショントグル）フォールバックも同時に廃止。
+- **現在**: `inject.js` は fiber 経由で `calculator`（`_rowHeightPx`/`_rowsLength`）を **読むだけ**。`_rowHeightPx` への
+  書き込みや `forceUpdate*` は一切行わない（`forceUpdate 不使用`）。固まりは keep-alive＋freezeWatch の同期スクロール
+  パルス（底→上→底）で対処する。`syncRowHeight`/`triggerRelayout` は現コードに存在しない。
 - リマウント（エモーション画面から復帰・タブ切替・SPA遷移）時は、コンテナ差し替えを検出して
   追従ON＋底へ強制追従（`forcePinLoop`, `FORCE_PIN_MS`）し「最新が見えない」を防ぐ。
 
@@ -210,6 +214,43 @@
   3. calculator と**6px以上ズレた時だけ** `forceUpdate`（**定常再描画＝フラッシュを廃止**）。収束後は再描画しない。
 - **限界**: 行高さ混在（テキスト/スタンプ/画像）を単一 `rowHeightPx` で完全一致はできない（niconico 仕様の制約）。
   最小値固定は「余白を出さない・発振しない」側に倒した設計で、その分わずかに過剰描画になりうる。
+
+## 下余白（ボトムブランク）— 「最新コメントに戻る」後にたまに出る空白
+
+> 🔬 1.2.21 で診断計測（`blankWatch`/`window.__crBlank`）を**一時追加 → 原因確定後に撤去し 1.2.20 へ戻した**
+> （知識はこの節に保存。**コードに `window.__crBlank`/`blankWatch` 等はもう無い**）。多視点ワークフローで原因網羅＋修正案を反証検証。
+
+- 症状: 最下部にいるのに**最後のコメントの下に空白**が出る。主に「最新コメントに戻る」直後、たまに。
+  開発当初からの既知問題で、固まり修正とは別。文字拡大で行が高いほど出やすい。
+- 仮想スクロールの幾何: `.table` は `height=scrollHeightPx(=rowHeightPx*rowsLength)`、`padding-top=marginTopPx`
+  （窓より上の行ぶん）、`padding-bottom=marginBottomPx`（窓より下の未描画行ぶんの予約スペース）。
+- ✅ **実機キャプチャで原因確定（2026-06-08, `window.__crBlank`/`__crBlanks` 計10件・撤去前に採取）**:
+  - **#1（reserved `marginBottomPx` 説）は誤り**: 全10件で `marginBottomPx=0`。空白は「窓より下の予約スペースの露出」では**ない**。
+  - **真因＝`rowHeightPx` 過大による「最下窓の under-fill」**: ニコ生の単一 `rowHeightPx` は**この回 62**（32 ではない！
+    `scrollHeight=11532=62*186`）。`frame=ceil(460/62)=8` で末尾窓は 8 行しか描かれないが、実行高さは平均 ~47px＝計 **380px**
+    しかないのに content box は `frame*rowHeightPx=8*62=496px` 予約 → 差 **116px が最終コメントの下に空白**。
+    `scrollTop=scrollHeight` はこの 116px を内包するのでピンでは閉じられない。`blankPx ≈ scrollHeight − lastRowBottomInContentPx`。
+  - これは旧「余白＝`rowHeightPx` が大きすぎ」説（CDP 節で『常に32・構造的に出ない』と誤判定したもの）を**部分復権**させる。
+    CDP の『常に32』は当該配信限定で、**文字拡大＋折り返しの実利用では niconico 自身が `rowHeightPx` を高く（62）確定**し
+    `frame` が小さくなって under-fill する。ただし `_rowHeightPx` 書き込みは ~400ms で revert する（CDP 既出）ので**書いて直す道は不可**。
+  - **2集団に分離**: (A) 一過性 catch-up（`newestLag>0`, `isAtBottomByIO=false`, `clearedAfterMs≈30ms`）＝forcePin 中の追いつき点滅・自己解消。
+    (B) **定常の本命**（`newestLag=0`, `isAtBottomByIO=true`, `persistentFrames=414/480`, `clearedAfterMs=null`＝固着。**クリック74秒後でも出る ＝forcePin 非依存**）。
+  - 付随: 本命サンプルは `outOfRange=true`（`scrollTop>maxInRangeTop`）＝固まりと同じ `rowHeightPx` 過大ファミリの別症状。
+- 🔑 **116px の内訳（決定的な精緻化）と「解消不能」の結論**:
+  - `116px = 80px（構造的 under-fill）＋ 36px（オーバースクロール）`。
+    - **80px ＝ ビューポート不足**: `clientHeight 460` に対し描画行は `8行 × ~47px ≈ 380px`。**ビューポートを埋めるには約2行足りない**。
+      この80pxは「**行をもっと描く**」以外で消せず、それには `rowHeightPx` を下げて `frame` を増やすしかない＝**~400msでrevertする死路**。
+    - **36px ＝ オーバースクロール**: `scrollTop(11072) − maxInRangeTop(11036)`。安全に削れるのはこの分だけ（116→80）。
+  - 検討した5案はすべて却下（多視点ワークフロー、最高スコア **3.5/10**）:
+    - **scroll-up / pin を `lastRowBottomInContentPx` へ**: scrollTop を上へ動かすのと幾何的に等価。窓固定なら80pxが**上へ移るだけ**、窓が動けば**最新を消す**。
+    - **render-more-rows**: 増えるのは最新より**上（古い行）**。`scrollHeight` は仮想定数で `lastRowBottom` 不変＝**空白不変**（むしろ slack 増）。
+    - **rowHeightPx one-shot**: ~400ms revert → 1.2.14 churn＋1.2.11 自励発振の再来、`forceUpdate` 復活（封印済み）。
+    - **container-compensation（負マージンで `scrollHeight` 圧縮）**: ブラウザが scrollTop を上へクランプ＝scroll-up と等価で**80pxを上へ移すだけ**。
+      しかも行への負マージンは `.table` の明示高さを変えず **no-op**、`.table` 直書きは React revert。
+    - **partial trim（36pxのみ）**: 唯一安全だが 116→80 の部分緩和で 80px は残る＝割に合わない。
+  - ⛳ **最終結論＝ニコ生仮想スクロールの構造的制約として受容**: 80px は「最下窓がビューポートを約2行ぶん埋めきれない」不足で、
+    `rowHeightPx` 書き換え（revert）なしには消せない。残る36pxのために React/keep-alive と毎フレーム競合する新コード路を足す価値は無い。
+    → **1.2.21 診断を撤去し 1.2.20 を据え置き**（推測修正を避ける＝ここでは「直さない」が正解）。
 
 ## コメントの並び順
 
