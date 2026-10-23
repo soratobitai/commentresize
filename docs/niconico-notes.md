@@ -51,8 +51,16 @@
     （※増減で判定する初版の固着対策はこの副作用があり、入力ベースへ差し替えた）。
   - `wheel/touchstart/touchmove/pointerdown/keydown` で `lastUserInputAt` を記録し（**2026-10-23〜 target がコメント欄の中の
     入力だけ**。重い時は scroll イベントが遅れて届くので、プレイヤー等のクリックを数えると再レイアウトの scroll を
-    ユーザー操作と誤認して追従が外れる。下記「上余白」節）、scroll イベントでは
-    「底付近(`<=NEAR_BOTTOM_PX`)なら追従ON」「`USER_INPUT_MS(300ms)` 以内のユーザー入力があり底でないなら追従OFF」。
+    ユーザー操作と誤認して追従が外れる。下記「上余白」節）。**数えるのは「コメント欄をスクロールさせる操作」だけ**:
+    wheel・touchmove・スクロールキー（PageUp/Down・矢印・Home/End・Space）・行を押したままのドラッグ（pointermove、選択の自動スクロール）・
+    スクロールバー（とコメント欄の余白）の押下中（離すまでずっと。つまみを押して止まってから動かしても引き戻さない。保険で15秒）。
+    **行のクリック（押しただけ）は数えない**＝直後に新着で行が入れ替わりスクロールアンカリングが scrollTop を下げると上スクロールと
+    取り違えるため。キーは「直前のクリックがコメント欄の中」でも数える（コメント行をクリックしてもフォーカスは body 等の外に残るが、
+    ブラウザは直前にクリックしたスクロール領域をキーで動かす。なおスクロールバーのクリック後はフォーカスがパネルへ移り、拡張 OFF でも
+    PageUp ではコメント欄が動かない）。scroll イベントでは「底付近(`<=NEAR_BOTTOM_PX`)、**または前回の scroll 時点の底まで下りてきた**
+    なら追従ON」（背の高い行だと、底へ着いた直後・scroll イベントが届く前にニコ生の再描画で下に内容が増え、届いた時点の距離では
+    底と判定できないため）「ユーザーのスクロール操作中で、**かつ scrollTop が上へ動いた**なら追従OFF」（新着で下に内容が増えた
+    だけの scroll を上スクロールと取り違えない）。
     それ以外（底でない＆ユーザー入力なし＝再レイアウト/undershoot）は**追従維持**し、`pinIfFollowing` が
     実際の底（実 `scrollHeight`）へ押し込む。これで誤OFFも固着も底未到達も起きない。
 
@@ -288,7 +296,9 @@ nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソー
 - **対策**: `HTMLElement.prototype.offsetHeight` と `Element.prototype.clientHeight` の getter をラップし、`.table-row` の値だけ
   `min(実測, 32)` を返す（`ROW_FLOOR_PX=32`＝main.js の `.table-row { min-height: 32px }`）。拡張 CSS 下ではどの行も 32px 以上なので
   `rowHeightPx ≤ 全行の高さ` が常に成り立つ＝ページ読込直後の通常状態が常に保たれる。`getBoundingClientRect`・`.table-row` 以外・
-  隔離ワールド（main.js）は影響なし。OFF 中（`data-cr-enabled="0"`）は丸めない。
+  隔離ワールド（main.js）は影響なし。**ユーザー設定が OFF（`data-cr-setting="off"`）の時だけ丸めない**。`data-cr-enabled` ではなく
+  設定を見るのは、マウント時の計測が拡張 CSS を当てる前に起きるため（丸めは rowHeightPx を下げるだけで余白は生まない＝CSS の
+  有無にかかわらず安全）。対象はコメントの行（`data-comment-type` を持つ `.table-row`）だけ。
 - **実機の証拠**（250%＋折り返しON、`e2e/probe_blank_hook.mjs` でフックを実行時に着脱して A/B）:
   - フックなし: 先頭行193px で再計測 → `rowHeightPx 193`・最下部の余白 **359px**。先頭行229px → `229`・**503px**、
     履歴閲覧中 **24/24 位置で余白（最大512px）**。
@@ -318,13 +328,19 @@ nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソー
     描画範囲の先頭が表示位置より下に来た分が上の余白になり、新着ごとに 32px ずつ広がる。
   - 実機（`e2e/probe_topblank.mjs auto`、rowsLength<200 の配信）: 上余白 **20→372px / 40秒**、見えるコメント 581→229px。
 - **対策（`inject.js`）**:
-  1. `detachInternalBottom`: 追従OFF中に内部が「最下部」なら、内部 scrollTop を `maxScrollTopPx − 1.01` に置く
-     （`scrollTopIsBottom` は `>= max−1`）。`rowsLength` setter が描画範囲を進めなくなり、表示位置に留まる（見た目は変わらない）。
-     ニコ生の `onScroll` は scroll ごとに内部値を実値で上書きするので、コメント欄自体の scroll リスナー（React より後に登録＝
-     後に走る）・`ensureObserving`（200ms）・描画後の rAF から掛け直す。
-  2. 追従OFFの判定に使うユーザー入力を**コメント欄の中の入力だけ**に限定（上記「固まる現象」節）。重い時の誤った追従OFF
-     （＝この症状のきっかけ）を減らす。
+  1. **追従OFFの間は `calculator.fixedBottom` を偽にする**（`applyFixedBottom`/`patchFixedBottom`。下の「底の少し上で読んでいると
+     行がずれる」節と同じ仕組み）。`rowsLength` の setter は `fixedBottom && 内部が底` の時だけ描画範囲を進めるので、表示位置に留まる。
+     `componentDidUpdate` が毎回 `setFixedBottom(props.fixedBottom)` で上書きするため、scrollProcessor インスタンスの `setFixedBottom`
+     を包んで「追従OFF中は偽」を保つ。追従に戻ったら元の値（コメント欄は常に true）へ。
+     ※出荷前レビュー前の版は内部 scrollTop を `max−1.01` に置いていたが、`max` が 32 の倍数付近（コメント欄の高さしだい）だと
+     描画範囲の先頭が1行ずれるため、この方式に置き換えた。
+  2. 追従OFFの判定に使うユーザー入力を**コメント欄の中の入力だけ**に限定し、さらに「scrollTop が上へ動いた」も条件にした
+     （上記「固まる現象」節）。重い時の誤った追従OFF（＝この症状のきっかけ）を減らす。
+  3. ニコ生が calculator を作り直したら（`forceUpdateLayout`＝resetPosition:「最新コメントに戻る」・コメントタブへの切替・コメント0件
+     からの復帰。どれも直後に `setScrollBottom` で底へ行く）、追従OFFでも追従に戻して底へ（`ensureObserving` で calculator の入れ替わりを検知）。
+     戻さないとゲートがその書き込みを止め、新しい calculator（底に固定）と実際の位置が食い違う。
   - 実機（同じ配信・同じ手順）: rowsLength 104→113 の間、描画範囲の先頭は 2656 で固定、**上余白 0・見えるコメント 601px のまま**。
+    置き換え後も rowsLength 125→128 で先頭 3360 のまま・上余白 0。タブ切替（calculator 作り直し）後は追従・底・上余白 0。
 
 ## 底の少し上で読んでいると行がずれる（200件到達後）— 2026-10-23 対策
 
@@ -338,14 +354,17 @@ nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソー
   （先頭の行が消え末尾に新着）、ブラウザのスクロールアンカリングが scrollTop を毎回補正する。たいていは見た目が保たれるが、
   補正しきれないと読んでいる行が跳ぶ（実機: 300px 上で30秒、描画行の入れ替わり3回のうち1回で **1フレームに115px**）。
   scrollTop は補正で上へずれていき、センチネルが画面外に出た瞬間に固定されて、そこでも跳ぶ（53px を観測）。
-- **対策（`inject.js` `patchBottomFlag`）**: scrollProcessor インスタンスの `isAtBottomByIO` を accessor に置き換え、
-  **追従OFF中（＝ユーザーが上スクロールした）は false**、追従中はニコ生の値をそのまま返す。上スクロールした時点でニコ生本来の
-  「固定＋最新コメントに戻る」になる。`isAtBottomByIO` はクラスフィールドなのでインスタンスごとに掛ける（`ensureObserving` で
-  `getScrollComponent()` から。作り直しにも追従）。追従OFF中は `scrollToNewBottom` の条件も偽になる（ゲートで止めていた書き込み自体が出ない）。
+- **対策（`inject.js` `applyFixedBottom`/`patchFixedBottom`）**: **追従OFF中（＝ユーザーが上スクロールした）は `calculator.fixedBottom`
+  を偽**にする。`isFixedBottomAvailable`（= `isAtBottomByIO && fixedBottom`）が偽になり、上スクロールした時点でニコ生本来の
+  「固定＋最新コメントに戻る」になる。`scrollToNewBottom` も `fixedBottom` を見るので、ゲートで止めていた書き込み自体が出ない。
+  `setFollowing` が追従の変化のたびに適用し（capture の scroll リスナー内＝ニコ生の onScroll より前）、`componentDidUpdate` の
+  上書きはインスタンスの `setFixedBottom` を包んで防ぐ（`orig.call(this, …)` で元の this を保つ）。上余白の対策と同じ1つの仕組み。
+  ※出荷前レビュー前の版は `isAtBottomByIO` を accessor で偽装していたが、`fixedBottom` 1つで両症状を扱えるので置き換えた。
 - 実機（`e2e/probe_reading_jumps.mjs`・`probe_rolling_drift.mjs`、rowsLength=200）: 150px/300px 上で各30秒、**描画行の入れ替わり0・
   跳び0・scrollTop の移動0・「最新コメントに戻る」表示**（その間も新着は届いていた）。底へ戻る／ボタンを押すと固定が解けて
   流れ再開、底での追従は通常どおり（20秒で新着3件表示・底から最大1px）。200件未満の間は固定されない（ニコ生仕様）が、
-  その間は追加のみで既存の行は動かず、上余白の対策（`detachInternalBottom`）で描画範囲も留まる。
+  その間は追加のみで既存の行は動かず、`fixedBottom` が偽なので描画範囲も留まる。ホイールで段階的に底へ戻しても固定は解ける
+  （`e2e/verify_resume_by_wheel.mjs` 3/3。ニコ生の scroll 判定は 100ms 間引きだが最後の位置も評価される）。
 
 ## コメントの並び順
 
@@ -378,12 +397,23 @@ nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソー
   フルスクリーン制御、コメント番号順の表示（CSS order、`ensureRowOrder`/`applyRowOrder`）。
 - 隔離ワールドとメインワールドは `Element.prototype` が別オブジェクト。隔離側からの `scrollTo` は
   メイン側の番人ラッパーに掛からない（= 拡張自身のスクロールはブロックされない）。この分離を活用。
-- **設定パネルの有効/無効は `<html data-cr-enabled="0|1">` で inject.js へ伝える**（メインワールドは
-  `chrome.storage` を読めない。DOM は両ワールド共有）。`main.js` が設定読み込み時とトグル時に書き、
-  inject.js は `'0'` の間ゲート/pin/keep-alive/freezeWatch/blankFix をすべて止める（未設定＝有効扱い）。
-  `following` の追跡だけは続け、再有効化時は追従中なら `forcePinLoop` で底へ収束させる（強制追従中は
+- **有効/無効は `<html data-cr-enabled="0|1">` で inject.js へ伝える**（メインワールドは `chrome.storage` を読めない。
+  DOM は両ワールド共有）。**`'1'` は拡張 CSS が実際に効いている時だけ**（設定 ON かつコメントのタブパネルがある＝
+  `main.js` の `enableExtensionTemporarily`/`disableExtensionTemporarily` で書く）。inject.js の補正（行高さの丸め・追従・
+  `fixedBottom` など）は拡張 CSS が前提なので、`'1'` 以外（未設定＝main.js が CSS を当てる前を含む）はゲート/pin/keep-alive/
+  freezeWatch/blankFix/`fixedBottom` をすべて止めて素のニコ生に任せる。切り替えは `MutationObserver`（attributeFilter）で即時に検知。
+  別に `data-cr-setting="on|off"`（ユーザー設定そのもの）も書き、行高さの丸めだけはこちらを見る（上記）。
+  有効化は CSS を当ててから伝える（`enableExtensionTemporarily` の最後）。無効化時は行の表示順の Observer も外す。
+  `following` の追跡だけは続け、有効化時は追従中なら `forcePinLoop` で底へ収束させる（強制追従中は
   上スクロールが引き戻されるので、窓は 400ms と短め）。
-  ※1.2.22 以前はこの受け渡しが無く、OFF にしても inject.js は動き続けていた。検証: `e2e/verify_toggle.mjs`。
+  ※1.2.22 以前はこの受け渡しが無く、OFF にしても inject.js は動き続けていた。検証: `e2e/verify_toggle.mjs`・`verify_review_fixes.mjs`。
+- 出荷前レビュー（2026-10-23、2回）で直した点は上の各節に反映。検証は `e2e/verify_review_fixes.mjs`（8項目: キー操作・行クリック
+  直後の誤解除・タブ切替・高速 OFF→ON・ドラッグ選択・スクロールバー長押し 等）。本物のクリックを使う e2e は `e2e/safe_page.mjs`
+  （本文やニコニ広告の行はリンクのことがあり、座標クリックで広告ページへ遷移した事故があった。遷移ブロック＋最前面の確認）。
+- 行高さの丸め（`clampRowHeightGetter`）と `getScrollComponent` は**コメントの行（`data-comment-type` を持つ `.table-row`）だけ**を対象にする。
+  ほかの DataGrid（`.table-row` を使う別の一覧）には触れない。
+- main.js の `beforeunload` での後片付け（全 Observer の切断）は撤去した。ページを離れない `beforeunload`（ダウンロードリンク・
+  離脱確認のキャンセル等）の後に拡張が止まったままになるため。実際のアンロードではブラウザがすべて破棄する。
 
 ## 開発・検証時の注意（ハマりどころ）
 

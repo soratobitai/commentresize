@@ -34,15 +34,19 @@
     let forcePinUntil = 0    // この時刻(performance.now)までは強制追従（余白対策）
 
     // コメント欄のスクロールコンテナ（CSS Modules のハッシュ付きクラスに部分一致）。
-    // ニコ生の改修で壊れたらここを直す（main.js の並べ替えトリガにも同じセレクタがある）。
+    // ニコ生の改修で壊れたらここを直す（main.js の行の表示順 ensureRowOrder にも同じセレクタがある）。
     const BODY_SEL = '[class*="_body_"]'
     const findBody = () => document.querySelector(BODY_SEL)
 
-    // 機能の有効/無効（設定パネルのトグル）。MAIN ワールドからは chrome.storage を読めないので、
-    // 隔離ワールドの main.js が <html data-cr-enabled="0|1"> で伝える。未設定（設定読み込み前）は有効扱い。
+    // 機能の有効/無効。MAIN ワールドからは chrome.storage を読めないので、隔離ワールドの main.js が
+    // <html data-cr-enabled="0|1"> で伝える。'1' は「拡張 CSS（文字拡大など）が実際に効いている」時だけ
+    // （設定 ON かつコメントのタブパネルがある）。未設定＝main.js がまだ CSS を当てていない間は無効扱い
+    // （CSS 前の行はニコ生本来の高さなので、素のニコ生のままが正しい）。
     // 無効中はゲート/pin/keep-alive/固まり回復/余白修正をすべて止めて素のニコ生に任せる。
     // following の追跡（scroll リスナー）だけは続け、再有効化した時に実際の位置と食い違わないようにする。
-    const isEnabled = () => document.documentElement.dataset.crEnabled !== '0'
+    const isEnabled = () => document.documentElement.dataset.crEnabled === '1'
+    // ユーザー設定そのものが OFF か（main.js が <html data-cr-setting="on|off"> で伝える。未設定＝読み込み前は OFF ではない）
+    const isSettingOff = () => document.documentElement.dataset.crSetting === 'off'
 
     const isCommentContainer = (el) =>
         el && el.nodeType === 1 && typeof el.matches === 'function' && el.matches(BODY_SEL)
@@ -93,7 +97,9 @@
     // （実機: 先頭行193px→rowHeightPx 193・最下部の余白359px、履歴閲覧中は24/24位置で最大512px）。
     // 拡張CSSは .table-row に min-height:32px を課すので、計測値を 32 以下に丸めれば rowHeightPx ≤ どの行の高さ
     // ＝描画行は常に足りる側になり、余白は原理的に出ない（ページ読込直後の通常状態 rowHeightPx=32 と同じ）。
-    // .table-row 以外・getBoundingClientRect・隔離ワールド（main.js）は影響を受けない。OFF中は素のニコ生のまま。
+    // .table-row 以外・getBoundingClientRect・隔離ワールド（main.js）は影響を受けない。
+    // マウント時の計測は拡張 CSS を当てる前に起きるので、data-cr-enabled ではなく「設定が OFF でない」だけを見る
+    // （丸めは rowHeightPx を下げるだけ＝描画行が多めになる側で、CSS の有無にかかわらず余白は生まない）。設定 OFF なら素のニコ生。
     const ROW_FLOOR_PX = 32   // main.js の .table-row { min-height: 32px } と揃える
     function clampRowHeightGetter(target, prop) {
         const d = Object.getOwnPropertyDescriptor(target, prop)
@@ -103,7 +109,8 @@
             enumerable: d.enumerable,
             get() {
                 const v = d.get.call(this)
-                return (v > ROW_FLOOR_PX && this.classList.contains('table-row') && isEnabled()) ? ROW_FLOOR_PX : v
+                // コメントの行（data-comment-type を持つ .table-row）だけ。ほかの一覧や要素には触れない。
+                return (v > ROW_FLOOR_PX && this.hasAttribute('data-comment-type') && this.classList.contains('table-row') && !isSettingOff()) ? ROW_FLOOR_PX : v
             },
         })
     }
@@ -111,8 +118,10 @@
     clampRowHeightGetter(Element.prototype, 'clientHeight')     // updateCalculator（「最新コメントに戻る」等）
 
     function setFollowing(v) {
+        const changed = following !== v
         following = v
         try { document.documentElement.dataset.crFollow = v ? '1' : '0' } catch (_) {}
+        if (changed) applyFixedBottom()   // ニコ生の「底に固定」も追従に合わせる（下の「fixedBottom」節）
     }
 
     // ★追従ON/OFF判定は「実際のユーザー入力」に基づける（固着・底未到達の両対策）。
@@ -133,29 +142,59 @@
         const tag = t.tagName
         return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true
     }
-    // コメント欄の中（スクロールバーを含む）での入力だけを数える。ページ読込中など重い時は scroll イベントが遅れて
-    // 届くため、プレイヤー等ほかの場所のクリックを数えると、ニコ生の再レイアウトによる scroll を「ユーザー操作」と
-    // 誤認して追従が外れる。コメント欄をスクロールさせる入力（ホイール/タッチ/スクロールバー/フォーカス中のキー）は
-    // 必ずコメント欄の中が target になる。
+    // 「コメント欄をスクロールさせる操作」だけを数える（コメント欄の中が target のものに限る）。
+    //  - ページ読込中など重い時は scroll イベントが遅れて届くので、プレイヤー等ほかの場所の操作を数えると、
+    //    ニコ生の再レイアウトによる scroll を「ユーザー操作」と誤認して追従が外れる。
+    //  - コメント行のクリック（押しただけ）も数えない。直後に新着で行が入れ替わり、スクロールアンカリングが
+    //    scrollTop を下げると上スクロールと取り違えるため。ドラッグ（選択の自動スクロール）は pointermove で数える。
+    //  - スクロールバー（とコメント欄の余白）の押下は、押している間ずっと操作中とみなす。つまみを押して少し止まって
+    //    から動かしても引き戻さないため（ネイティブのスクロールバー操作中はポインタ移動が来ないことがある）。
     const isInCommentList = (t) => !!(t && t.nodeType === 1 && t.closest(BODY_SEL))
-    for (const type of ['wheel', 'touchstart', 'touchmove', 'pointerdown']) {
+    const SCROLL_KEYS = new Set(['PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'Home', 'End', ' ', 'Spacebar'])
+    const SCROLLBAR_HOLD_MAX_MS = 15000   // 離した通知が来なかった時の保険
+    let lastPointerInComment = false       // 直前のクリックがコメント欄の中だったか（キー操作のスクロール先の判定用）
+    let pressInList = false                // コメント欄の中で押している（ドラッグ選択の判定用）
+    let scrollbarPressAt = -1e9            // スクロールバーを押した時刻（離したら -1e9）
+    document.addEventListener('pointerdown', (e) => {
+        const inside = isInCommentList(e.target)
+        lastPointerInComment = pressInList = inside
+        if (inside && isCommentContainer(e.target)) { scrollbarPressAt = performance.now(); markUserInput() }
+    }, { capture: true, passive: true })
+    document.addEventListener('pointermove', (e) => { if (pressInList && e.buttons) markUserInput() }, { capture: true, passive: true })
+    for (const type of ['pointerup', 'pointercancel', 'mouseup']) {
+        document.addEventListener(type, () => { pressInList = false; scrollbarPressAt = -1e9 }, { capture: true, passive: true })
+    }
+    for (const type of ['wheel', 'touchmove']) {
         document.addEventListener(type, (e) => { if (isInCommentList(e.target)) markUserInput() }, { capture: true, passive: true })
     }
-    // keydown だけは入力欄を除外（PageUp/Down・矢印・スペース等のスクロール意図は引き続き拾う）。
+    // キーはスクロールキーだけ。入力欄は除外。コメント行やスクロールバーをクリックしてもフォーカスはコメント欄の外
+    // （body やパネル）に残るが、ブラウザは直前にクリックしたスクロール領域をキーで動かすので、それも数える。
     document.addEventListener('keydown', (e) => {
-        if (!isTypingTarget(e.target) && isInCommentList(e.target)) markUserInput()
+        if (SCROLL_KEYS.has(e.key) && !isTypingTarget(e.target) && (isInCommentList(e.target) || lastPointerInComment)) markUserInput()
     }, { capture: true, passive: true })
+    const isUserScrolling = (now) => (now - lastUserInputAt < USER_INPUT_MS) || (now - scrollbarPressAt < SCROLLBAR_HOLD_MAX_MS)
 
+    // 直前の scroll イベント時の scrollTop と、その時点の底（上下どちらへ動いたか・底まで下りたかの判定用）。
+    // コメント欄が差し替わったら ensureObserving が初期化する。
+    let lastSeenTop = 0, lastSeenMaxTop = Infinity
     document.addEventListener('scroll', (e) => {
         const el = e.target
         if (!isCommentContainer(el)) return
         const now = performance.now()
+        const top = el.scrollTop, maxTop = el.scrollHeight - el.clientHeight
+        const wentUp = top < lastSeenTop - 1
+        // 前回の scroll 時点の底まで下りてきた＝底に着いた。背の高い行だと、底へ着いた直後（scroll イベントが届く前）に
+        // ニコ生の再描画で下に内容が増え、この時点の距離では底と判定できないことがあるため。
+        const reachedPrevBottom = top > lastSeenTop + 1 && top >= lastSeenMaxTop - NEAR_BOTTOM_PX
+        lastSeenTop = top; lastSeenMaxTop = maxTop
         // 強制追従ウィンドウ中は、再描画の揺れで追従を外さない（余白＝追従喪失の防止）
         if (now < forcePinUntil) { setFollowing(true); return }
-        if (distFromBottom(el) <= NEAR_BOTTOM_PX) {
+        if (distFromBottom(el) <= NEAR_BOTTOM_PX || reachedPrevBottom) {
             setFollowing(true)                                 // 底付近 → 追従再開
-        } else if (now - lastUserInputAt < USER_INPUT_MS) {
-            setFollowing(false)                                // ユーザー操作で底から離れた → 追従解除
+        } else if (wentUp && isUserScrolling(now)) {
+            // ユーザー操作で上へ動いた → 追従解除。「上へ動いた」も条件にするのは、新着で下に内容が増えた
+            // （scrollTop は減っていない）だけの scroll を上スクロールと取り違えないため。
+            setFollowing(false)
         }
         // 底でない＆ユーザー入力なし＝ニコ生の再レイアウト/undershoot → 追従維持＋実際の底へ補正
         if (following) pinIfFollowing()
@@ -179,7 +218,7 @@
     let fpRaf = 0
     function forcePinLoop() {
         fpRaf = 0
-        if (!isEnabled()) return   // 無効化されたら鎖を止める（再有効化時は ensureObserving が掛け直す）
+        if (!isEnabled()) return   // 無効化されたら鎖を止める（有効化時は onEnabledChanged が追従中なら掛け直す）
         const el = findBody()
         if (el) pinToBottom(el)
         blankFixWatch()   // 余白の高速検知: クリック/リマウント直後の rAF 密ウィンドウで即修正（throttle/settle/cooldown で暴発防止）
@@ -218,7 +257,8 @@
         }
         _scrollComp = null
         try {
-            const start = document.querySelector('.table-row') || findBody()
+            // コメントの行（data-comment-type）から辿る。ほかの一覧（.table-row）のコンポーネントを掴まないように。
+            const start = document.querySelector('.table-row[data-comment-type]') || observedEl || findBody()
             if (!start) return null
             const fk = Object.keys(start).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'))
             if (!fk) return null
@@ -354,45 +394,32 @@
         if (el && distFromBottom(el) > 0) pinToBottom(el)
     }
 
-    // ===== 追従を外している間は、ニコ生内部の「最下部」も外す（上の余白が増え続けて何も見えなくなる問題の対策）=====
-    // calculator は内部 scrollTop を仮想の底（rowHeightPx*rowsLength − 表示高さ）で頭打ちにする。拡張で行が高いと
-    // 実際の内容は仮想より長く、実際の底より少し上（仮想の底より下）にいても内部では「最下部」扱いになる。
-    // その状態でゲートが引き戻しを止めていると（following=false）、新着で rowsLength が増えるたび（200件に達する
-    // までの間＝主にページ読込直後）calculator は描画範囲を1行ずつ下へ進め（paddingTop += rowHeightPx）、実際の
-    // scrollTop は動かないので、上に余白ができて新着ごとに広がり、最後は何も表示されなくなる
-    // （実機: 上余白 20→372px / 40秒、+32px/件）。内部 scrollTop を底のわずか手前に置けば描画範囲は今の位置に留まる。
-    // ニコ生の onScroll（scroll ごとに内部 scrollTop を実値で上書き）の後に掛け直す必要があるので、コメント欄の
-    // scroll リスナー（React の後に登録＝後に走る）と定期監視・描画後の rAF から呼ぶ。
-    function detachInternalBottom() {
-        if (following || !isEnabled()) return
+    // ===== 追従を外している間は、ニコ生の「底に固定」(fixedBottom) も外す =====
+    // ニコ生のコメント欄は calculator.fixedBottom（＝底に固定）が真の間だけ、次の3つを行う:
+    //   (1) 新着で rowsLength が増える時、内部 scrollTop が底なら描画範囲も底へ進める（rowsLength の setter）
+    //   (2) componentDidUpdate の scrollToNewBottom で実際の scrollTop を底へ書く
+    //   (3) pc-watch が scroll のたびに見る isFixedBottomAvailable（= isAtBottomByIO && fixedBottom）を真にし、
+    //       200件以上でもリストを固定しない（偽なら固定して「最新コメントに戻る」を出す）
+    // 拡張で行が高いと、実際の底より少し上でもニコ生は「底」と判定する（内部 scrollTop は仮想の底で頭打ち、
+    // 底センチネルも仮想の底にあって画面内に残る）。そのため追従を外しても (1)(3) が続き、
+    //   ・200件に達するまで（主にページ読込直後）描画範囲だけが進み、上の余白が新着ごとに広がって最後は何も見えなくなる
+    //     （実機: 20→372px / 40秒）
+    //   ・200件に達した後はリストが流れ続け、読んでいる行が跳ぶ（実機: 1フレームに115px）
+    // 追従OFFの間は fixedBottom を偽にして、ニコ生本来の「上スクロール中は固定」に揃える。追従に戻ったら元の値へ。
+    // componentDidUpdate が毎回 setFixedBottom(props の値) で上書きするので、インスタンスの setFixedBottom を包む。
+    let fbRequested = true             // ニコ生が setFixedBottom で指定した値（コメント欄は常に true）
+    const fbPatched = new WeakSet()
+    const wantFixedBottom = (v) => (following || !isEnabled()) ? v : false
+    function applyFixedBottom() {
         const comp = getScrollComponent()
         const calc = comp && comp.scrollProcessor && comp.scrollProcessor.calculator
-        if (!calc || !calc.scrollTopIsBottom) return
-        const max = calc.maxScrollTopPx
-        if (max > 2) calc.scrollTopPx = max - 1.01   // scrollTopIsBottom は「>= max−1」
+        if (calc) calc.fixedBottom = wantFixedBottom(fbRequested)
     }
-
-    // ===== 追従を外している間は、ニコ生の「底にいる」判定（isAtBottomByIO）も外す（底の少し上で読んでいる時のズレ対策）=====
-    // pc-watch は scroll のたびに、!isFixedBottomAvailable（= !(isAtBottomByIO && fixedBottom)）かつ 200件に達していれば
-    // リストを固定（shouldUpdateNewComments=false）して「最新コメントに戻る」を出す＝上スクロール中は行が流れない。
-    // ところが isAtBottomByIO の元になる底センチネルは仮想の底（rowsLength*rowHeightPx）に置かれ、拡張で行が高いと
-    // 実際の底の少し上でもセンチネルが画面内に残る → 「底にいる」扱いでリストが流れ続け、読んでいる行の前後で行が
-    // 足し引きされる。スクロールアンカリングが補正しきれないと読んでいる行が跳ぶ（実機で1フレームに115px）。
-    // 追従OFF（＝ユーザーが上スクロールした）の間は false を返し、ニコ生本来の「上スクロールで固定」に揃える。
-    // 追従中はニコ生の値をそのまま返す。isAtBottomByIO はクラスフィールド（インスタンスごとの値）なのでインスタンスに掛ける。
-    const bottomFlagPatched = new WeakSet()
-    function patchBottomFlag(sp) {
-        if (!sp || bottomFlagPatched.has(sp)) return
-        bottomFlagPatched.add(sp)
-        let real = sp.isAtBottomByIO
-        try {
-            Object.defineProperty(sp, 'isAtBottomByIO', {
-                configurable: true,
-                enumerable: true,
-                get() { return (following || !isEnabled()) ? real : false },
-                set(v) { real = v },
-            })
-        } catch (_) {}
+    function patchFixedBottom(sp) {
+        if (!sp || fbPatched.has(sp) || typeof sp.setFixedBottom !== 'function') return
+        fbPatched.add(sp)
+        const orig = sp.setFixedBottom
+        sp.setFixedBottom = function (v) { fbRequested = !!v; return orig.call(this, wantFixedBottom(v)) }
     }
 
     // ===== 下余白の修正（エモーション・トグルでリマウント→niconico に rowHeightPx を再計測させる）=====
@@ -447,7 +474,7 @@
         const now = performance.now()
         if (!following) { reviveBlankSince = 0; return }
         if (distFromBottom(el) > NEAR_BOTTOM_PX + 6) { reviveBlankSince = 0; return }  // 最下部だけ
-        if (now - lastUserInputAt < USER_INPUT_MS) { reviveBlankSince = 0; return }    // 操作中は触らない
+        if (isUserScrolling(now)) { reviveBlankSince = 0; return }    // 操作中は触らない
         try { if (isTypingTarget(document.activeElement)) { reviveBlankSince = 0; return } } catch (_) {}
         const comp = getScrollComponent()
         const calc = comp && comp.scrollProcessor && comp.scrollProcessor.calculator
@@ -544,7 +571,7 @@
     let rafId = 0
     const schedulePin = () => {
         if (rafId) return
-        rafId = requestAnimationFrame(() => { rafId = 0; following ? pinIfFollowing() : detachInternalBottom() })
+        rafId = requestAnimationFrame(() => { rafId = 0; pinIfFollowing() })
     }
 
     let observedEl = null
@@ -552,18 +579,26 @@
     let ro = null
     if (typeof ResizeObserver === 'function') ro = new ResizeObserver(schedulePin)
 
-    // コメント欄が現れる／差し替わるたびに監視対象を張り替える
-    let wasEnabled = true
-    function ensureObserving() {
+    // 有効/無効の切り替え（main.js が data-cr-enabled を書き換えた時）に即座に反応する。
+    let wasEnabled = isEnabled()
+    function onEnabledChanged() {
         const enabled = isEnabled()
-        if (enabled && !wasEnabled && following) {
-            // 再有効化: 拡張CSS（文字拡大）の再適用で高さが変わるが、コメント欄のサイズも子要素も変わらず
+        if (enabled === wasEnabled) return
+        wasEnabled = enabled
+        applyFixedBottom()   // 無効化＝ニコ生の値へ戻す／有効化＝追従状態に合わせる
+        if (enabled && following) {
+            // 有効化: 拡張CSS（文字拡大）の適用で高さが変わるが、コメント欄のサイズも子要素も変わらず
             // MO/RO が鳴らない。追従中なら次の新着を待たず底へ収束させる。強制追従中は上スクロールが
             // 引き戻されるので、CSS 1回分の再レイアウトが収まる短い窓にとどめる（以後は通常の pin が追う）。
             forcePinUntil = Math.max(forcePinUntil, performance.now() + 400)
             startForcePin()
         }
-        wasEnabled = enabled
+    }
+    new MutationObserver(onEnabledChanged).observe(document.documentElement, { attributes: true, attributeFilter: ['data-cr-enabled'] })
+
+    // コメント欄が現れる／差し替わるたびに監視対象を張り替える
+    let lastCalc = null
+    function ensureObserving() {
         const el = findBody()
         if (el && el !== observedEl) {
             try { mo.disconnect() } catch (_) {}
@@ -572,10 +607,9 @@
             // 自分のリマウント以外（=ニコ生由来の新規マウント: SPA遷移/エモーション復帰等）なら余白修正の失敗カウントを再アーム
             if (performance.now() - lastEmoRemountAt > REVIVE_COOLDOWN_MS) reviveFailStreak = 0
             observedEl = el
+            lastSeenTop = 0; lastSeenMaxTop = Infinity   // 前のコメント欄の位置と比べない
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
-            // React（ニコ生の onScroll）より後に登録＝後に走る。ニコ生が内部 scrollTop を実値で上書きした直後に掛け直す。
-            el.addEventListener('scroll', detachInternalBottom, { passive: true })
             // コメント欄が新規生成/差し替え（初期表示・エモーション画面から復帰・タブ切替・SPA遷移）された。
             // 最新へ追従し、内容が確定するまで底へ強制追従して「最新が見えない」を防ぐ。
             setFollowing(true)
@@ -583,9 +617,26 @@
             startForcePin()
             schedulePin()
         }
-        const comp = getScrollComponent()   // 2秒キャッシュ付き
-        if (comp) patchBottomFlag(comp.scrollProcessor)   // コメント欄が作り直されたら新しいインスタンスにも掛ける
-        detachInternalBottom()   // 追従OFF中に内部が最下部へ戻っていたら外す（上余白の暴走防止の保険）
+        if (!document.hidden) {
+            const comp = getScrollComponent()   // 2秒キャッシュ付き
+            const sp = comp && comp.scrollProcessor
+            if (sp) {
+                patchFixedBottom(sp)            // コメント欄が作り直されたら新しいインスタンスにも掛ける
+                if (sp.calculator !== lastCalc) {
+                    lastCalc = sp.calculator
+                    // calculator が作り直された＝ニコ生が最新へ戻す操作をした（resetPosition:「最新コメントに戻る」・
+                    // コメントタブへの切替・コメント0件からの復帰。どれも直後に setScrollBottom で底へ行く）か、リマウント。
+                    // 追従OFFのままだと、その底への書き込みをゲートが止め、新しい calculator は底に固定されたままなので
+                    // 実際の位置と食い違う。ニコ生の意図どおり追従に戻して底へ。
+                    if (!following && isEnabled()) {
+                        setFollowing(true)
+                        forcePinUntil = performance.now() + FORCE_PIN_MS
+                        startForcePin()
+                    }
+                    applyFixedBottom()
+                }
+            }
+        }
         // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。
         freezeWatch()
         blankFixWatch()   // 下余白の修正（既定ON。window.__crNoReviveBlank=true で無効）。
@@ -610,7 +661,7 @@
         if (window.__crNoKeepAlive) return                  // A/B検証用トグル: keep-alive を無効化
         if (!isEnabled()) return                            // 機能OFF中は素のニコ生に任せる
         if (!following) return                              // 追従中だけ
-        if (now - lastUserInputAt < USER_INPUT_MS) return   // ユーザー操作中はそっとしておく
+        if (isUserScrolling(now)) return                   // ユーザー操作中はそっとしておく
         const el = observedEl || findBody()
         if (!el) return
         if (distFromBottom(el) > NEAR_BOTTOM_PX + 6) return // 最下部の時だけ

@@ -18,7 +18,7 @@ let contentsTabPanelObserver = null // contents-tab-panel監視用Observer
 let isInitialized = false // 初期化完了フラグ
 let initializationTimeout = null // 初期化用タイマー
 let fullscreenCheckFunction = null // フルスクリーンチェック関数の参照
-let fullscreenRetryTimeout = null // フルスクリーン監視の再試行タイマー（cleanupで解除）
+let fullscreenRetryTimeout = null // フルスクリーン監視の再試行タイマー（多重スケジュール防止）
 let rootTargetNode = null // ルート要素(#root)。リマウント時のUI再注入に使う
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
 // 底追従・自動スクロールは inject.js(メインワールド)が担当する
@@ -35,6 +35,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // chrome.storageから設定を取得
     chrome.storage.sync.get(['commentNumberFontSize', 'commentTextFontSize', 'isShowFullComment', 'isExtensionEnabled'], (result) => {
+        result = result || {} // 読み出しに失敗すると result が無いことがある → 下でデフォルト値を使う
         // エラーハンドリング
         if (chrome.runtime.lastError) {
             // console.warn('設定の読み出しに失敗しました:', chrome.runtime.lastError)
@@ -132,6 +133,10 @@ function updateExtensionStateBasedOnTabPanel() {
  * 機能拡張を一時的に無効化（設定には影響しない）
  */
 function disableExtensionTemporarily() {
+    syncEnabledFlagToPage()
+    // 行の表示順の監視も止める（CSS の flex が無いと order は効かない。有効化時に ensureRowOrder が張り直す）
+    if (rowOrderObserver) rowOrderObserver.disconnect()
+    rowOrderTable = null
     removeCommentStyles()
     document.documentElement.style.removeProperty('--comment-number-size')
     document.documentElement.style.removeProperty('--comment-text-size')
@@ -149,20 +154,27 @@ function enableExtensionTemporarily() {
 
     // 既存のコメントに弾幕判定を適用
     processComments()
-    // 無効中は付け直していなかった表示順を今の行で確定する
-    ensureRowOrder()
-    applyRowOrder()
+    // 無効中は付け直していなかった表示順を今の行で確定する（張り替えた時は ensureRowOrder の中で適用済み）
+    if (!ensureRowOrder()) applyRowOrder()
     // リマウントで失われた設定UI（Aaボタン/パネル）を必要なら貼り直す（冪等）
     ensureSettingsUi()
-    // 底追従とスクロールは inject.js(メインワールド)が担当する
+    // 底追従とスクロールは inject.js(メインワールド)が担当する。CSS を当て終えてから有効を伝える
+    syncEnabledFlagToPage()
 }
 
 /**
  * 有効/無効を inject.js(メインワールド)へ伝える。メインワールドは chrome.storage を読めないため、
  * 両ワールドで共有している DOM の属性 <html data-cr-enabled> で受け渡す。
+ * data-cr-enabled='1' は拡張 CSS が実際に効いている時（設定 ON かつコメントのタブパネルがある）だけ。inject.js の補正
+ * （追従・fixedBottom など）は拡張 CSS が前提なので、CSS を外している間は素のニコ生に任せる。
+ * data-cr-setting はユーザー設定そのもの（on/off）。行高さの丸めは CSS を当てる前のマウント時の計測にも効かせたいので、
+ * こちらだけを見る。
  */
 function syncEnabledFlagToPage() {
-    try { document.documentElement.dataset.crEnabled = isExtensionEnabled ? '1' : '0' } catch (_) {}
+    try {
+        document.documentElement.dataset.crSetting = isExtensionEnabled ? 'on' : 'off'
+        document.documentElement.dataset.crEnabled = (isExtensionEnabled && isTabPanelAvailable) ? '1' : '0'
+    } catch (_) {}
 }
 
 /**
@@ -172,8 +184,7 @@ function disableExtension() {
     if (!isExtensionEnabled) return
 
     isExtensionEnabled = false
-    syncEnabledFlagToPage()
-    disableExtensionTemporarily()
+    disableExtensionTemporarily() // ここで inject.js へも無効を伝える
     
     // 設定を保存
     saveSettings({ isExtensionEnabled }, true)
@@ -189,11 +200,12 @@ function enableExtension() {
     if (isExtensionEnabled) return
     
     isExtensionEnabled = true
-    syncEnabledFlagToPage()
 
-    // contents-tab-panelが存在する場合のみ実際に機能を有効化
+    // contents-tab-panelが存在する場合のみ実際に機能を有効化（CSS を当ててから inject.js へ有効を伝える）
     if (isTabPanelAvailable) {
         enableExtensionTemporarily()
+    } else {
+        syncEnabledFlagToPage() // 設定 ON だけ伝える（CSS はまだ無いので data-cr-enabled は '0' のまま）
     }
     
     // 設定を保存
@@ -291,6 +303,9 @@ function startCommentMonitoring(targetNode) {
             scheduleInitialization(targetNode)
         }
 
+        // 監視中のコメント欄が外された（リマウントで旧・新が一時的に並存し、旧を掴んでいた等）→ 今のものへ張り替える
+        if (isInitialized && rowOrderTable && !rowOrderTable.isConnected) ensureRowOrder()
+
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
             processComments(newTableRows)
@@ -353,17 +368,19 @@ function initializeApp(targetNode) {
 // DOM を並べ替えていたため、入れ替わる様子が見えて読んでいる行がずれ、React が管理する DOM を動かすことで
 // 右クリックメニューの対象行（DOM の位置から番号を引く）もずれ得た。MutationObserver のコールバックは描画
 // （ペイント）前に走るので、ニコ生が行を描いたのと同じフレームで順序が確定し、入れ替わりは見えない。
+// 監視先を張り替えたら適用まで行って true を返す（変わっていなければ false）。
 function ensureRowOrder() {
     const row = document.querySelector('[class*="_body_"] > .table > .table-row[data-comment-type]')
     const table = row ? row.parentElement : null
-    if (table === rowOrderTable) return
+    if (table === rowOrderTable) return false
     if (rowOrderObserver) rowOrderObserver.disconnect()
     rowOrderTable = table
-    if (!table) return
+    if (!table) return false
     if (!rowOrderObserver) rowOrderObserver = new MutationObserver(applyRowOrder)
     // 行の追加/削除に加え、ニコ生は行の DOM を使い回して中身（番号のテキスト）だけ書き換えるので characterData も見る
     rowOrderObserver.observe(table, { childList: true, subtree: true, characterData: true })
     applyRowOrder()
+    return true
 }
 
 function applyRowOrder() {
@@ -404,58 +421,6 @@ function saveSettings(settings, immediate = false) {
                 }
             })
         }, 500) // 500ms遅延
-    }
-}
-
-/**
- * リソースのクリーンアップ
- */
-function cleanupResources() {
-    // タイマーのクリーンアップ
-    if (saveTimeout) {
-        clearTimeout(saveTimeout)
-        saveTimeout = null
-    }
-    if (updateStylesTimeout) {
-        clearTimeout(updateStylesTimeout)
-        updateStylesTimeout = null
-    }
-    if (initializationTimeout) {
-        clearTimeout(initializationTimeout)
-        initializationTimeout = null
-    }
-    if (fullscreenRetryTimeout) {
-        clearTimeout(fullscreenRetryTimeout)
-        fullscreenRetryTimeout = null
-    }
-
-    // Observerのクリーンアップ
-    if (rowOrderObserver) {
-        rowOrderObserver.disconnect()
-        rowOrderObserver = null
-        rowOrderTable = null
-    }
-    if (commentInsertObserver) {
-        commentInsertObserver.disconnect()
-        commentInsertObserver = null
-    }
-    if (fullscreenObserver) {
-        fullscreenObserver.disconnect()
-        fullscreenObserver = null
-    }
-    if (contentsTabPanelObserver) {
-        contentsTabPanelObserver.disconnect()
-        contentsTabPanelObserver = null
-    }
-
-    isInitialized = false
-
-    // フルスクリーンイベントリスナーのクリーンアップ
-    if (fullscreenCheckFunction) {
-        document.removeEventListener('fullscreenchange', fullscreenCheckFunction)
-        document.removeEventListener('webkitfullscreenchange', fullscreenCheckFunction)
-        document.removeEventListener('mozfullscreenchange', fullscreenCheckFunction)
-        fullscreenCheckFunction = null
     }
 }
 
@@ -945,7 +910,7 @@ function watchFullscreenChange() {
         const optionButton = document.getElementsByClassName('option-button')[0]
 
         if (!optionButton) {
-            // option-button要素が見つからない場合は、少し遅延して再試行（cleanupで解除できるよう追跡）
+            // option-button要素が見つからない場合は、少し遅延して再試行（多重スケジュールしないよう追跡）
             fullscreenRetryTimeout = setTimeout(watchFullscreenChange, 1000)
             return
         }
@@ -997,7 +962,7 @@ function watchFullscreenChange() {
             document.removeEventListener('webkitfullscreenchange', fullscreenCheckFunction)
             document.removeEventListener('mozfullscreenchange', fullscreenCheckFunction)
         }
-        // グローバル変数に保存（クリーンアップ用）
+        // グローバル変数に保存（再設定時に古いリスナーを外すため）
         fullscreenCheckFunction = checkFullscreen
 
         // ResizeObserverでサイズ変化を監視
@@ -1008,7 +973,7 @@ function watchFullscreenChange() {
         // 監視対象の要素を取得
         const elements = document.querySelectorAll('[class*="_player-display-footer-area_"]')
         if (elements.length === 0) {
-            // 監視対象が見つからない場合は、少し遅延して再試行（cleanupで解除できるよう追跡）
+            // 監視対象が見つからない場合は、少し遅延して再試行（多重スケジュールしないよう追跡）
             fullscreenRetryTimeout = setTimeout(watchFullscreenChange, 2000)
             return
         }
@@ -1034,11 +999,6 @@ function watchFullscreenChange() {
         // console.warn('フルスクリーン監視設定中にエラーが発生しました:', error)
     }
 }
-
-// ページアンロード時のクリーンアップ
-window.addEventListener('beforeunload', () => {
-    cleanupResources()
-})
 
 /**
  * .table-row の border-bottom を消すスタイルを追加
