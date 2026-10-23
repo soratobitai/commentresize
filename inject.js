@@ -155,22 +155,37 @@
     let lastPointerInComment = false       // 直前のクリックがコメント欄の中だったか（キー操作のスクロール先の判定用）
     let pressInList = false                // コメント欄の中で押している（ドラッグ選択の判定用）
     let scrollbarPressAt = -1e9            // スクロールバーを押した時刻（離したら -1e9）
+    // 直前のスクロール操作の向き（-1=上、+1=下、0=不明：スクロールバーやドラッグ）。下向きの操作中に scrollTop が
+    // 下がっても、それはユーザーの上スクロールではない（新着で行が入れ替わった時のスクロールアンカリングの補正など）。
+    let lastUserDir = 0
+    const markScroll = (dir) => { lastUserDir = dir; markUserInput() }
     document.addEventListener('pointerdown', (e) => {
         const inside = isInCommentList(e.target)
         lastPointerInComment = pressInList = inside
-        if (inside && isCommentContainer(e.target)) { scrollbarPressAt = performance.now(); markUserInput() }
+        if (inside && isCommentContainer(e.target)) { scrollbarPressAt = performance.now(); markScroll(0) }
     }, { capture: true, passive: true })
-    document.addEventListener('pointermove', (e) => { if (pressInList && e.buttons) markUserInput() }, { capture: true, passive: true })
+    document.addEventListener('pointermove', (e) => { if (pressInList && e.buttons) markScroll(0) }, { capture: true, passive: true })
     for (const type of ['pointerup', 'pointercancel', 'mouseup']) {
         document.addEventListener(type, () => { pressInList = false; scrollbarPressAt = -1e9 }, { capture: true, passive: true })
     }
-    for (const type of ['wheel', 'touchmove']) {
-        document.addEventListener(type, (e) => { if (isInCommentList(e.target)) markUserInput() }, { capture: true, passive: true })
-    }
+    document.addEventListener('wheel', (e) => {
+        if (isInCommentList(e.target) && e.deltaY) markScroll(e.deltaY < 0 ? -1 : 1)
+    }, { capture: true, passive: true })
+    let lastTouchY = null
+    document.addEventListener('touchstart', (e) => { lastTouchY = e.touches[0] ? e.touches[0].clientY : null }, { capture: true, passive: true })
+    document.addEventListener('touchmove', (e) => {
+        if (!isInCommentList(e.target) || !e.touches[0]) return
+        const y = e.touches[0].clientY
+        markScroll(lastTouchY == null || y === lastTouchY ? 0 : (y > lastTouchY ? -1 : 1))   // 指を下へ＝上の内容を見る
+        lastTouchY = y
+    }, { capture: true, passive: true })
     // キーはスクロールキーだけ。入力欄は除外。コメント行やスクロールバーをクリックしてもフォーカスはコメント欄の外
     // （body やパネル）に残るが、ブラウザは直前にクリックしたスクロール領域をキーで動かすので、それも数える。
+    const KEY_DIR = { PageUp: -1, ArrowUp: -1, Home: -1, PageDown: 1, ArrowDown: 1, End: 1 }
     document.addEventListener('keydown', (e) => {
-        if (SCROLL_KEYS.has(e.key) && !isTypingTarget(e.target) && (isInCommentList(e.target) || lastPointerInComment)) markUserInput()
+        if (SCROLL_KEYS.has(e.key) && !isTypingTarget(e.target) && (isInCommentList(e.target) || lastPointerInComment)) {
+            markScroll(e.key in KEY_DIR ? KEY_DIR[e.key] : (e.shiftKey ? -1 : 1))   // Space は Shift で上
+        }
     }, { capture: true, passive: true })
     const isUserScrolling = (now) => (now - lastUserInputAt < USER_INPUT_MS) || (now - scrollbarPressAt < SCROLLBAR_HOLD_MAX_MS)
 
@@ -191,9 +206,10 @@
         if (now < forcePinUntil) { setFollowing(true); return }
         if (distFromBottom(el) <= NEAR_BOTTOM_PX || reachedPrevBottom) {
             setFollowing(true)                                 // 底付近 → 追従再開
-        } else if (wentUp && isUserScrolling(now)) {
+        } else if (wentUp && isUserScrolling(now) && lastUserDir !== 1) {
             // ユーザー操作で上へ動いた → 追従解除。「上へ動いた」も条件にするのは、新着で下に内容が増えた
-            // （scrollTop は減っていない）だけの scroll を上スクロールと取り違えないため。
+            // （scrollTop は減っていない）だけの scroll を上スクロールと取り違えないため。下向きの操作中の上への動き
+            // （底へ戻る途中で新着が入り、スクロールアンカリングが scrollTop を下げた等）でも外さない。
             setFollowing(false)
         }
         // 底でない＆ユーザー入力なし＝ニコ生の再レイアウト/undershoot → 追従維持＋実際の底へ補正
@@ -415,11 +431,24 @@
         const calc = comp && comp.scrollProcessor && comp.scrollProcessor.calculator
         if (calc) calc.fixedBottom = wantFixedBottom(fbRequested)
     }
+    // 追従中はニコ生の「底にいる」(isAtBottomByIO) も真にする。これの元の底センチネルは仮想の底にあり、拡張で行が高いと
+    // 実際の底では画面の上へ外れて偽になる → pc-watch が「底にいない」と判断してリストを固定し「最新コメントに戻る」を出す
+    // （底へ戻っても流れが再開しない／底にいるのに止まる）。追従OFF中は fixedBottom が偽なので、ここはニコ生の値のまま。
+    // isAtBottomByIO はインスタンスのフィールド（IO のコールバックと scrollToNewBottom が代入するだけ）なので accessor にする。
     function patchFixedBottom(sp) {
         if (!sp || fbPatched.has(sp) || typeof sp.setFixedBottom !== 'function') return
         fbPatched.add(sp)
         const orig = sp.setFixedBottom
         sp.setFixedBottom = function (v) { fbRequested = !!v; return orig.call(this, wantFixedBottom(v)) }
+        let ioReal = sp.isAtBottomByIO
+        try {
+            Object.defineProperty(sp, 'isAtBottomByIO', {
+                configurable: true,
+                enumerable: true,
+                get() { return (following && isEnabled()) ? true : ioReal },
+                set(v) { ioReal = v },
+            })
+        } catch (_) {}
     }
 
     // ===== 下余白の修正（エモーション・トグルでリマウント→niconico に rowHeightPx を再計測させる）=====

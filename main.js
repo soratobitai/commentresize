@@ -797,6 +797,14 @@ function createCommentStyles() {
             --comment-wrap-mode: ${isShowFullComment ? 'normal' : 'nowrap'};
         }
         
+        /* コメント欄のスクロールアンカリングを切る。ニコ生は全行を同じ高さ（行高さの丸めで 32px）として描画範囲を決めるので、
+           文字が大きく実際の行がそれより高いと、スクロールのたびに範囲外へ外れる行の分だけ内容がずれる。ブラウザが表示位置を
+           保とうと scrollTop を逆向きに補正し、ニコ生の再描画と押し合いになって下へスクロールできなくなる（上へ戻した後に
+           底へ戻れない）。切ると行単位で進むが、スクロールは必ず操作の向きに進む。 */
+        [class*="_body_"]:has(> .table > .table-row[data-comment-type]) {
+            overflow-anchor: none !important;
+        }
+
         /* コメント番号順の表示：DOM は動かさず CSS order で並べる（applyRowOrder）。order は flex 内でだけ効く */
         [class*="_body_"] > .table {
             display: flex !important;
