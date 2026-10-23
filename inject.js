@@ -133,12 +133,17 @@
         const tag = t.tagName
         return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true
     }
+    // コメント欄の中（スクロールバーを含む）での入力だけを数える。ページ読込中など重い時は scroll イベントが遅れて
+    // 届くため、プレイヤー等ほかの場所のクリックを数えると、ニコ生の再レイアウトによる scroll を「ユーザー操作」と
+    // 誤認して追従が外れる。コメント欄をスクロールさせる入力（ホイール/タッチ/スクロールバー/フォーカス中のキー）は
+    // 必ずコメント欄の中が target になる。
+    const isInCommentList = (t) => !!(t && t.nodeType === 1 && t.closest(BODY_SEL))
     for (const type of ['wheel', 'touchstart', 'touchmove', 'pointerdown']) {
-        document.addEventListener(type, markUserInput, { capture: true, passive: true })
+        document.addEventListener(type, (e) => { if (isInCommentList(e.target)) markUserInput() }, { capture: true, passive: true })
     }
     // keydown だけは入力欄を除外（PageUp/Down・矢印・スペース等のスクロール意図は引き続き拾う）。
     document.addEventListener('keydown', (e) => {
-        if (!isTypingTarget(e.target)) markUserInput()
+        if (!isTypingTarget(e.target) && isInCommentList(e.target)) markUserInput()
     }, { capture: true, passive: true })
 
     document.addEventListener('scroll', (e) => {
@@ -349,6 +354,24 @@
         if (el && distFromBottom(el) > 0) pinToBottom(el)
     }
 
+    // ===== 追従を外している間は、ニコ生内部の「最下部」も外す（上の余白が増え続けて何も見えなくなる問題の対策）=====
+    // calculator は内部 scrollTop を仮想の底（rowHeightPx*rowsLength − 表示高さ）で頭打ちにする。拡張で行が高いと
+    // 実際の内容は仮想より長く、実際の底より少し上（仮想の底より下）にいても内部では「最下部」扱いになる。
+    // その状態でゲートが引き戻しを止めていると（following=false）、新着で rowsLength が増えるたび（200件に達する
+    // までの間＝主にページ読込直後）calculator は描画範囲を1行ずつ下へ進め（paddingTop += rowHeightPx）、実際の
+    // scrollTop は動かないので、上に余白ができて新着ごとに広がり、最後は何も表示されなくなる
+    // （実機: 上余白 20→372px / 40秒、+32px/件）。内部 scrollTop を底のわずか手前に置けば描画範囲は今の位置に留まる。
+    // ニコ生の onScroll（scroll ごとに内部 scrollTop を実値で上書き）の後に掛け直す必要があるので、コメント欄の
+    // scroll リスナー（React の後に登録＝後に走る）と定期監視・描画後の rAF から呼ぶ。
+    function detachInternalBottom() {
+        if (following || !isEnabled()) return
+        const comp = getScrollComponent()
+        const calc = comp && comp.scrollProcessor && comp.scrollProcessor.calculator
+        if (!calc || !calc.scrollTopIsBottom) return
+        const max = calc.maxScrollTopPx
+        if (max > 2) calc.scrollTopPx = max - 1.01   // scrollTopIsBottom は「>= max−1」
+    }
+
     // ===== 下余白の修正（エモーション・トグルでリマウント→niconico に rowHeightPx を再計測させる）=====
     // 実機調査(2026-06, e2e の CDP プローブ)で機構を確認:
     //  - エモーションパネルの開閉はコメント欄を破棄→再生成（リマウント）する（_body_/calculator/sentinel の
@@ -498,7 +521,7 @@
     let rafId = 0
     const schedulePin = () => {
         if (rafId) return
-        rafId = requestAnimationFrame(() => { rafId = 0; pinIfFollowing() })
+        rafId = requestAnimationFrame(() => { rafId = 0; following ? pinIfFollowing() : detachInternalBottom() })
     }
 
     let observedEl = null
@@ -528,6 +551,8 @@
             observedEl = el
             mo.observe(el, { childList: true, subtree: true })
             if (ro) ro.observe(el)
+            // React（ニコ生の onScroll）より後に登録＝後に走る。ニコ生が内部 scrollTop を実値で上書きした直後に掛け直す。
+            el.addEventListener('scroll', detachInternalBottom, { passive: true })
             // コメント欄が新規生成/差し替え（初期表示・エモーション画面から復帰・タブ切替・SPA遷移）された。
             // 最新へ追従し、内容が確定するまで底へ強制追従して「最新が見えない」を防ぐ。
             setFollowing(true)
@@ -535,6 +560,7 @@
             startForcePin()
             schedulePin()
         }
+        detachInternalBottom()   // 追従OFF中に内部が最下部へ戻っていたら外す（上余白の暴走防止の保険）
         // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。
         freezeWatch()
         blankFixWatch()   // 下余白の修正（既定ON。window.__crNoReviveBlank=true で無効）。

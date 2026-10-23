@@ -49,7 +49,9 @@
     仮想スクロールの再計算で**単調に増えない**ため、増減（方向）だけで判定すると、3〜4行のコメントで
     scrollTop が一時的に小さくなった時に「上スクロール」と誤検知し追従OFFにラッチ → **底まで届かず止まる**
     （※増減で判定する初版の固着対策はこの副作用があり、入力ベースへ差し替えた）。
-  - `wheel/touchstart/touchmove/pointerdown/keydown` で `lastUserInputAt` を記録し、scroll イベントでは
+  - `wheel/touchstart/touchmove/pointerdown/keydown` で `lastUserInputAt` を記録し（**2026-10-23〜 target がコメント欄の中の
+    入力だけ**。重い時は scroll イベントが遅れて届くので、プレイヤー等のクリックを数えると再レイアウトの scroll を
+    ユーザー操作と誤認して追従が外れる。下記「上余白」節）、scroll イベントでは
     「底付近(`<=NEAR_BOTTOM_PX`)なら追従ON」「`USER_INPUT_MS(300ms)` 以内のユーザー入力があり底でないなら追従OFF」。
     それ以外（底でない＆ユーザー入力なし＝再レイアウト/undershoot）は**追従維持**し、`pinIfFollowing` が
     実際の底（実 `scrollHeight`）へ押し込む。これで誤OFFも固着も底未到達も起きない。
@@ -299,6 +301,30 @@ nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソー
 - 1.2.22 の `blankFixWatch`/`emotionRemount` は `rowHeightPx>36` でしか動かないため、このフックが効いている間は発火しない。
   ニコ生が計測方法（例: `getBoundingClientRect`）を変えてフックが外れた時の予備として残している。
 - 残る余白: 高速スクロール中の描画遅れによる一瞬の空白は仮想スクロール自体の性質。描画停止（固まり）は keep-alive が担当。
+
+## 上余白（トップブランク）— 上に余白ができて新着ごとに広がり、最後は何も見えなくなる（2026-10-23 対策）
+
+- 症状（ユーザー報告）: ページ読込時など PC が重い時に、コメント欄の**上**に余白が出て、そのまま広がり続け、
+  最後はコメントが何も表示されなくなる。
+- **仕組み（nicolib を読んで実機で再現）**:
+  - calculator の内部 scrollTop は `updateScrollTopPx` で `min(実 scrollTop, maxScrollTopPx)`＝**仮想の底で頭打ち**。
+    拡張で行が高いと実際の内容は仮想より長いので、**実際の底より少し上（仮想の底より下）にいても内部では「最下部」**
+    （`scrollTopIsBottom`）。
+  - `rowsLength` の setter は「`fixedBottom` かつ内部が最下部」なら `scrollToBottom()`（内部 scrollTop を新しい底へ）。
+    コメント欄は `render()` の先頭で `updateRowsLength` を呼ぶので、新着のたびに描画範囲が1行下へ進む
+    （`paddingTop += rowHeightPx`）。`rowsLength` は 200 で頭打ちなので、**進むのは200件に達するまで＝主にページ読込直後**。
+  - ふだんはニコ生の `scrollToNewBottom` が実 scrollTop も底へ書くので一致するが、inject.js が追従を外している
+    （`following=false`）とゲートがその書き込みを止める → **描画範囲だけ下へ進み、実 scrollTop は動かない** →
+    描画範囲の先頭が表示位置より下に来た分が上の余白になり、新着ごとに 32px ずつ広がる。
+  - 実機（`e2e/probe_topblank.mjs auto`、rowsLength<200 の配信）: 上余白 **20→372px / 40秒**、見えるコメント 581→229px。
+- **対策（`inject.js`）**:
+  1. `detachInternalBottom`: 追従OFF中に内部が「最下部」なら、内部 scrollTop を `maxScrollTopPx − 1.01` に置く
+     （`scrollTopIsBottom` は `>= max−1`）。`rowsLength` setter が描画範囲を進めなくなり、表示位置に留まる（見た目は変わらない）。
+     ニコ生の `onScroll` は scroll ごとに内部値を実値で上書きするので、コメント欄自体の scroll リスナー（React より後に登録＝
+     後に走る）・`ensureObserving`（200ms）・描画後の rAF から掛け直す。
+  2. 追従OFFの判定に使うユーザー入力を**コメント欄の中の入力だけ**に限定（上記「固まる現象」節）。重い時の誤った追従OFF
+     （＝この症状のきっかけ）を減らす。
+  - 実機（同じ配信・同じ手順）: rowsLength 104→113 の間、描画範囲の先頭は 2656 で固定、**上余白 0・見えるコメント 601px のまま**。
 
 ## コメントの並び順
 
