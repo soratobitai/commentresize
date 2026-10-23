@@ -22,9 +22,8 @@ let fullscreenRetryTimeout = null // フルスクリーン監視の再試行タ�
 let rootTargetNode = null // ルート要素(#root)。リマウント時のUI再注入に使う
 let isTabPanelAvailable = false // contents-tab-panelの存在フラグ（一時的な状態）
 // 底追従・自動スクロールは inject.js(メインワールド)が担当する
-let sortDebounceTimer = null // コメント並べ替えのデバウンス用タイマー
-let sortScrollHandler = null // 並べ替えトリガ用スクロールハンドラ参照（remove用）
-const SORT_IDLE_MS = 250 // スクロールがこの時間止まったら1回だけ並べ替える
+let rowOrderObserver = null // コメント行の表示順（CSS order）を描画直後に付け直すObserver
+let rowOrderTable = null // rowOrderObserver が監視中のコメント欄 .table
 // 保存値のサニタイズ：フォントサイズは 50–300% の数値文字列に正規化（不正値が innerHTML/CSS へ流れるのを防ぐ）
 const clampPct = (v) => Math.min(300, Math.max(50, parseInt(v, 10) || 100)) + '%'
 
@@ -150,6 +149,9 @@ function enableExtensionTemporarily() {
 
     // 既存のコメントに弾幕判定を適用
     processComments()
+    // 無効中は付け直していなかった表示順を今の行で確定する
+    ensureRowOrder()
+    applyRowOrder()
     // リマウントで失われた設定UI（Aaボタン/パネル）を必要なら貼り直す（冪等）
     ensureSettingsUi()
     // 底追従とスクロールは inject.js(メインワールド)が担当する
@@ -292,6 +294,7 @@ function startCommentMonitoring(targetNode) {
         // 初期化が完了している場合は通常のコメント処理を実行
         if (hasNewComments && isInitialized) {
             processComments(newTableRows)
+            ensureRowOrder() // リマウントでコメント欄が作り直されたら監視を張り替える
             // 底追従は inject.js(メインワールド)が担当する
         }
     })
@@ -341,22 +344,40 @@ function initializeApp(targetNode) {
     // contents-tab-panelの監視を開始
     startContentsTabPanelMonitoring(targetNode)
 
-    // コメント番号順の並べ替え：スクロールが止まった時だけ実行（mutation毎は負荷で危険）
-    attachSortOnScrollIdle()
+    // コメント番号順の表示（CSS order。描画直後に確定するので入れ替わりは見えない）
+    ensureRowOrder()
 }
 
-// スクロールが SORT_IDLE_MS 止まったら1回だけ並べ替えるリスナーを document に張る。
-// 連続スクロール中はタイマーが伸び続けて並べ替えは走らないため、仮想スクロールの
-// 再描画と競合せず、激しいスクロール時の DOM 操作の嵐（=クラッシュ）を避けられる。
-function attachSortOnScrollIdle() {
-    if (sortScrollHandler) return // 二重登録防止
-    sortScrollHandler = (event) => {
-        const el = event.target
-        if (!el || typeof el.matches !== 'function' || !el.matches('[class*="_body_"]')) return
-        if (sortDebounceTimer) clearTimeout(sortDebounceTimer)
-        sortDebounceTimer = setTimeout(sortCommentRows, SORT_IDLE_MS)
+// コメント番号順の表示：DOM は動かさず、CSS order で見た目の順序だけを番号順にする（.table は flex 縦並び）。
+// ニコ生はライブのコメントを受信順で足すので、隣り合う番号が前後することがある。旧実装はスクロール停止後に
+// DOM を並べ替えていたため、入れ替わる様子が見えて読んでいる行がずれ、React が管理する DOM を動かすことで
+// 右クリックメニューの対象行（DOM の位置から番号を引く）もずれ得た。MutationObserver のコールバックは描画
+// （ペイント）前に走るので、ニコ生が行を描いたのと同じフレームで順序が確定し、入れ替わりは見えない。
+function ensureRowOrder() {
+    const row = document.querySelector('[class*="_body_"] > .table > .table-row[data-comment-type]')
+    const table = row ? row.parentElement : null
+    if (table === rowOrderTable) return
+    if (rowOrderObserver) rowOrderObserver.disconnect()
+    rowOrderTable = table
+    if (!table) return
+    if (!rowOrderObserver) rowOrderObserver = new MutationObserver(applyRowOrder)
+    // 行の追加/削除に加え、ニコ生は行の DOM を使い回して中身（番号のテキスト）だけ書き換えるので characterData も見る
+    rowOrderObserver.observe(table, { childList: true, subtree: true, characterData: true })
+    applyRowOrder()
+}
+
+function applyRowOrder() {
+    const table = rowOrderTable
+    if (!table || !isExtensionEnabled || !isTabPanelAvailable) return
+    let last = 0
+    for (const row of table.children) {
+        const numberEl = row.querySelector('.comment-number')
+        const n = numberEl ? parseInt(numberEl.textContent.replace(/\D/g, ''), 10) : NaN
+        // 番号の無い行（ニコニ広告・運営コメント等）は直前の番号と同じ値＝その行のすぐ後ろに留まる（同値は DOM 順）
+        if (n > 0) last = n
+        const order = String(last)
+        if (row.style.order !== order) row.style.order = order
     }
-    document.addEventListener('scroll', sortScrollHandler, { capture: true, passive: true })
 }
 
 /**
@@ -403,22 +424,17 @@ function cleanupResources() {
         clearTimeout(initializationTimeout)
         initializationTimeout = null
     }
-    if (sortDebounceTimer) {
-        clearTimeout(sortDebounceTimer)
-        sortDebounceTimer = null
-    }
     if (fullscreenRetryTimeout) {
         clearTimeout(fullscreenRetryTimeout)
         fullscreenRetryTimeout = null
     }
 
-    // 並べ替えトリガのスクロールリスナーを外す
-    if (sortScrollHandler) {
-        document.removeEventListener('scroll', sortScrollHandler, { capture: true })
-        sortScrollHandler = null
-    }
-
     // Observerのクリーンアップ
+    if (rowOrderObserver) {
+        rowOrderObserver.disconnect()
+        rowOrderObserver = null
+        rowOrderTable = null
+    }
     if (commentInsertObserver) {
         commentInsertObserver.disconnect()
         commentInsertObserver = null
@@ -759,54 +775,6 @@ function processComments(commentRows = null) {
     }
 }
 
-// コメント欄の行をコメント番号の昇順に並べ替える（スクロール停止時に1回だけ呼ばれる）。
-// ニコ生は古いコメントの取得時などにほぼ同時刻のコメントを受信順（番号順でない）で
-// 挿入することがあり、番号が前後する。表示中の行は通常フロー（スペーサー兄弟なし）なので
-// DOM順を直せば見た目も直る。スクロール静止時に実行するので niconico の再描画と競合しない。
-// 既に昇順なら DOM を触らない。
-function sortCommentRows() {
-    if (!isExtensionEnabled || !isTabPanelAvailable) return
-    try {
-        const rows = Array.from(document.querySelectorAll('.table-row'))
-        if (rows.length < 2) return
-
-        const numberOf = (row) => {
-            const el = row.querySelector('.comment-number')
-            if (!el) return null
-            const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''), 10)
-            return Number.isFinite(n) ? n : null
-        }
-
-        // 対象は1コンテナ分だけにスコープ（リマウントで旧コンテナが一時併存しても、別コンテナの
-        // 行をこの親へ移動させて混線させない）。
-        const parent = rows[0].parentElement
-        if (!parent) return
-        const scoped = rows.filter((r) => r.parentElement === parent)
-        if (scoped.length < 2) return
-
-        // 既に番号昇順なら並べ替え不要（DOMを触らない）
-        let alreadySorted = true
-        let prev = null
-        for (const row of scoped) {
-            const n = numberOf(row)
-            if (n == null) continue // 番号の無い行（運営コメント等）は順序判定から除外
-            if (prev != null && n < prev) { alreadySorted = false; break }
-            prev = n
-        }
-        if (alreadySorted) return
-
-        // 番号で安定ソート（番号が無い行は元の相対位置を保つ）
-        const ordered = scoped
-            .map((row, index) => ({ row, index, n: numberOf(row) }))
-            .sort((a, b) => (a.n == null || b.n == null) ? a.index - b.index : a.n - b.n)
-            .map((o) => o.row)
-
-        ordered.forEach((row) => parent.appendChild(row))
-    } catch (error) {
-        // console.warn('コメント並べ替え中にエラーが発生しました:', error)
-    }
-}
-
 /**
  * CSS変数を更新してコメントスタイルを適用（最適化版）
  */
@@ -864,7 +832,14 @@ function createCommentStyles() {
             --comment-wrap-mode: ${isShowFullComment ? 'normal' : 'nowrap'};
         }
         
+        /* コメント番号順の表示：DOM は動かさず CSS order で並べる（applyRowOrder）。order は flex 内でだけ効く */
+        [class*="_body_"] > .table {
+            display: flex !important;
+            flex-direction: column !important;
+        }
+
         .table-row {
+            flex-shrink: 0 !important; /* .table の固定高さに合わせて行が縮まないように（block の時と同じ高さを保つ） */
             height: auto !important;
             min-height: 32px !important; /* inject.js の ROW_FLOOR_PX と揃える（行高さ計測の上限＝余白対策の前提） */
             padding-top: 0.4rem !important;
