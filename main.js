@@ -866,7 +866,7 @@ function createCommentStyles() {
         
         .table-row {
             height: auto !important;
-            min-height: 32px !important;
+            min-height: 32px !important; /* inject.js の ROW_FLOOR_PX と揃える（行高さ計測の上限＝余白対策の前提） */
             padding-top: 0.4rem !important;
             padding-bottom: 0.4rem !important;
             border-bottom: 1px solid rgba(150,150,150,0.4) !important;

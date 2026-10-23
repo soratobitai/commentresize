@@ -84,6 +84,32 @@
         return nativeScrollTo.apply(this, args)
     }
 
+    // ===== 行高さの計測を最小行高さ以下に抑える（コメント欄の余白の根本対策）=====
+    // nicolib の DataGrid は全行を1つの rowHeightPx で扱い、その値を「1行だけ」の DOM 高さから取る:
+    //   - マウント時: 行0 の ref（initializeCalculator）で e.offsetHeight
+    //   - forceUpdateLayout→updateCalculator: 先頭に描画中の行の clientHeight で calculator を作り直す
+    //     （pc-watch の resetPosition＝「最新コメントに戻る」/コメントタブ切替/コメント0件からの復帰 の100ms後）
+    // その1行がたまたま背の高いコメントだと rowHeightPx が膨張し、余白 = Σ(rowHeightPx − 実際の行高さ) が出る
+    // （実機: 先頭行193px→rowHeightPx 193・最下部の余白359px、履歴閲覧中は24/24位置で最大512px）。
+    // 拡張CSSは .table-row に min-height:32px を課すので、計測値を 32 以下に丸めれば rowHeightPx ≤ どの行の高さ
+    // ＝描画行は常に足りる側になり、余白は原理的に出ない（ページ読込直後の通常状態 rowHeightPx=32 と同じ）。
+    // .table-row 以外・getBoundingClientRect・隔離ワールド（main.js）は影響を受けない。OFF中は素のニコ生のまま。
+    const ROW_FLOOR_PX = 32   // main.js の .table-row { min-height: 32px } と揃える
+    function clampRowHeightGetter(target, prop) {
+        const d = Object.getOwnPropertyDescriptor(target, prop)
+        if (!d || typeof d.get !== 'function') return
+        Object.defineProperty(target, prop, {
+            configurable: true,
+            enumerable: d.enumerable,
+            get() {
+                const v = d.get.call(this)
+                return (v > ROW_FLOOR_PX && this.classList.contains('table-row') && isEnabled()) ? ROW_FLOOR_PX : v
+            },
+        })
+    }
+    clampRowHeightGetter(HTMLElement.prototype, 'offsetHeight') // initializeCalculator（マウント時）
+    clampRowHeightGetter(Element.prototype, 'clientHeight')     // updateCalculator（「最新コメントに戻る」等）
+
     function setFollowing(v) {
         following = v
         try { document.documentElement.dataset.crFollow = v ? '1' : '0' } catch (_) {}
@@ -332,6 +358,8 @@
     //    内部メソッドは無い（calculator に measure/initialized 系が無い）。だから再計測にはリマウントが要る。
     //  - リマウントで rowHeightPx が小さく測り直されれば frame が増え余白が閉じる（ユーザー実体験で有効）。
     //    先頭飛びは既存の forcePin がフレーム0から吸収する（実機で distFromBottom=0 維持を確認）。
+    // ※余白の根本対策は上の clampRowHeightGetter（計測値を 32 以下に丸める）。それが効いている間は rowHeightPx>36 に
+    //   ならないのでここは発火しない。ニコ生が計測方法を変えてフックが外れた時のための予備として残している。
     // ★既定ON（2026-06-08 実機で `rowHeightBefore65→After32 / blank176→0 / +1.5s維持 / 発火1回` を確認し採用）。
     //   無効化は window.__crNoReviveBlank=true。過剰なリマウントを避けるため
     //   「最下部・操作なし・rowHeightPx>実行平均×1.15・余白>60px が ~600ms 定常」の時だけ1回（クールダウン付き）。

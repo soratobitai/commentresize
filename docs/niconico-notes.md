@@ -217,6 +217,9 @@
 
 ## 下余白（ボトムブランク）— 「最新コメントに戻る」後にたまに出る空白
 
+> ✅ **2026-10-23 根本対策済み**（下の「2026-10-23 根本対策」節）。nicolib のソースを読んで計測箇所を特定し、
+> MAIN ワールドで計測値そのものを丸める方式に変更。以下の 06-08 までの記述は経緯として残す。
+
 > 🔬 1.2.21 で診断計測（`blankWatch`/`window.__crBlank`）を**一時追加 → 原因確定後に撤去し 1.2.20 へ戻した**
 > （知識はこの節に保存。**コードに `window.__crBlank`/`blankWatch` 等はもう無い**）。多視点ワークフローで原因網羅＋修正案を反証検証。
 
@@ -260,6 +263,42 @@
 - ✅ **実装＝既定ON `inject.js` `blankFixWatch`/`emotionRemount`（実機実証済み・1.2.22）**: 「最下部・操作なし・`rowHeightPx>36`（軽量プレ判定で既定フォントの常時 rect 計測を省く）・`rowHeightPx>実行平均×1.15`・余白>60px が ~600ms 定常」の時だけ、**リマウントボタンを2回トグルして1回リマウント**（クールダウン3s＝`REVIVE_COOLDOWN_MS`）→ niconico がマウント時に rowHeightPx を素の32へ測り直し→frame 増→余白解消。先頭飛びは forcePin 吸収、開閉アニメは一時 `transition:none` 抑制（実機でチラつき体感なし）、入力中スキップ。**リマウントボタン**: `[aria-label="エモーションパネルの開閉"]` → 無ければ `[aria-label="ギフト"]`（放送設定でエモーションOFF時の代替。実機でギフトのトグルもリマウント確認）。両方無ければ no-op（無害）。**無効化** `window.__crNoReviveBlank=true`。記録 `window.__crBlankFix={rowHeightBefore/After,blankBefore/After,rowHeightAt1500/blankAt1500,method:'emotion'|'gift'}`・`window.__crStats.blankFix`。**実機検証(2026-06-08)**: 自然余白で `rowHeightBefore65→After32 / blank176→0 / +1.5s維持 / 発火1回`、自動発火で余白解消をユーザー確認＝採用（上の「受容」結論は本機能で上書き）。
 - 🛡 **出荷前レビューで追加した安全策**: ①**効果判定バックオフ**＝発火+1.5sで `rowHeightPx>36`（=効かなかった）or ボタン不在なら失敗カウント、`REVIVE_MAX_FAILS=2` で停止（効かない配信での無限リマウント防止）。ニコ生由来の新規マウント（SPA遷移/エモーション復帰＝自分のリマウント以外）で `reviveFailStreak` をリセット＝再アーム。②**非表示タブで停止**（`document.hidden`）。③**rAF飢餓ウォッチドッグ**＝背景化で rAF が止まっても2s後に `emoBusy`/`transition:none` を確実に解放。④**フォーカスは閉じクリック直後に復元**。⑤パネル開き中は `_body_` が消えるので blankFixWatch は `!el` で発火不可＝開いたパネルを誤トグルしない。
 - ⏱ **レイテンシ短縮**: forcePin 抑止を撤去＋`REVIVE_SETTLE_MS 600→100`＋`forcePinLoop` の毎フレームから高速検知（rect は50ms throttle）＝余白出現から **約2s→約0.3s** で回復。
+
+### 2026-10-23 根本対策：行高さの計測値を丸める（`inject.js` `clampRowHeightGetter`）
+nicolib（確認時 `nicolib.8b63309f86.js` / `pc-watch.8e5f9be6.js`）のソースを直接読んで、`rowHeightPx` の出どころを特定した:
+- **計算器（minified `class b`）**: 全行を単一の `_rowHeightPx` で扱う。`scrollHeightPx=rowHeightPx*rowsLength`、
+  `frameRowLength=ceil(offsetHeight/rowHeightPx)`、`bufferRowLength=ceil(frame*bufferSize)`、`startRowIndex=floor(scrollTop/rowHeightPx)−buffer`、
+  `.table` の style は `paddingTop=startRowIndex*rowHeightPx`・`height=totalHeightPx−paddingTop`。
+- **計測は「1行だけ」の DOM 高さ**（2か所）:
+  1. `initializeCalculator`: **行 index 0** の ref（`onMount`、未初期化の時だけ）で `e.offsetHeight`。
+  2. `updateCalculator`（`forceUpdateLayout` から）: **先頭に描画中の行**（`body.firstChild.firstChild`）の `clientHeight` で
+     `scrollProcessor.initialize` → **calculator を `new b` で作り直す**。
+- **`forceUpdateLayout` の呼び出し元**（pc-watch）: `resetPosition`＝100ms 後に `forceUpdateLayout()`＋`setScrollBottom(0)`。
+  `resetPosition` は **「最新コメントに戻る」（indicator の onClick）／コメントタブへの切替／コメント0件からの復帰** で呼ばれる。
+  → 上スクロール中、画面の先頭行がたまたま背の高いコメントの時に「最新に戻る」を押すと、その行の高さが全行の高さになる＝
+  これまでの「`rowHeightPx` 膨張（62/65/74/99/165）」と「上スクロール＋最新復帰の反復で再現」の正体。
+- **ページ読込直後が 32 になる理由**: 初回マウント時は main.js の CSS がまだ入っていない（最初の行の 500ms 後に適用）ので
+  ニコ生本来の 32px 行を測る。
+- **余白の式**: 描画窓の各行について `Σ(rowHeightPx − 実際の行高さ)`。正なら最下部では最新コメントの下に、履歴閲覧中は
+  描画行の下（ビューポート下部）に余白が出る。`rowHeightPx ≤ どの行の高さ` なら描画は常に足りる側で、余白は出ない。
+- **以前の「`_rowHeightPx` 書き込みは ~400ms で revert」**は、calculator が `updateCalculator` 等で作り直されたためと見られる
+  （どの呼び出しだったかは未確認）。インスタンスへの書き込みは作り直しで消えるが、**計測元の DOM 読み取りは MAIN ワールドで制御できる**。
+- **対策**: `HTMLElement.prototype.offsetHeight` と `Element.prototype.clientHeight` の getter をラップし、`.table-row` の値だけ
+  `min(実測, 32)` を返す（`ROW_FLOOR_PX=32`＝main.js の `.table-row { min-height: 32px }`）。拡張 CSS 下ではどの行も 32px 以上なので
+  `rowHeightPx ≤ 全行の高さ` が常に成り立つ＝ページ読込直後の通常状態が常に保たれる。`getBoundingClientRect`・`.table-row` 以外・
+  隔離ワールド（main.js）は影響なし。OFF 中（`data-cr-enabled="0"`）は丸めない。
+- **実機の証拠**（250%＋折り返しON、`e2e/probe_blank_hook.mjs` でフックを実行時に着脱して A/B）:
+  - フックなし: 先頭行193px で再計測 → `rowHeightPx 193`・最下部の余白 **359px**。先頭行229px → `229`・**503px**、
+    履歴閲覧中 **24/24 位置で余白（最大512px）**。
+  - フックあり: 同じ操作で `rowHeightPx 32`・余白 **0**、履歴 **0/24**。
+  - 実装後（`e2e/verify_blank_fix.mjs`）: 先頭行157pxで `forceUpdateLayout` → 32・余白0・履歴0/24。**本物の「最新コメントに戻る」クリック**
+    でも 32・0・0/24。ギフト・トグルのリマウント（新しい calculator を確認）でも 32。実高さ105pxの行は `offsetHeight/clientHeight=32`、
+    コメント欄自体は実値（556）のまま。`verify_toggle.mjs` 9/9。
+- **トレードオフ**: `rowHeightPx(32) < 実際の行高さ` なので描画行数が多め（frame＋buffer で数十行）になり、履歴スクロールの位置と行の対応は
+  32px/行で近似される。ただしこれはページ読込直後（ふだん）の状態と同じで、新たに生じるものではない。
+- 1.2.22 の `blankFixWatch`/`emotionRemount` は `rowHeightPx>36` でしか動かないため、このフックが効いている間は発火しない。
+  ニコ生が計測方法（例: `getBoundingClientRect`）を変えてフックが外れた時の予備として残している。
+- 残る余白: 高速スクロール中の描画遅れによる一瞬の空白は仮想スクロール自体の性質。描画停止（固まり）は keep-alive が担当。
 
 ## コメントの並び順
 
