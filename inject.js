@@ -33,8 +33,19 @@
     let selfScrolling = false // このスクリプト自身による pin 中はゲートを通す
     let forcePinUntil = 0    // この時刻(performance.now)までは強制追従（余白対策）
 
+    // コメント欄のスクロールコンテナ（CSS Modules のハッシュ付きクラスに部分一致）。
+    // ニコ生の改修で壊れたらここを直す（main.js の並べ替えトリガにも同じセレクタがある）。
+    const BODY_SEL = '[class*="_body_"]'
+    const findBody = () => document.querySelector(BODY_SEL)
+
+    // 機能の有効/無効（設定パネルのトグル）。MAIN ワールドからは chrome.storage を読めないので、
+    // 隔離ワールドの main.js が <html data-cr-enabled="0|1"> で伝える。未設定（設定読み込み前）は有効扱い。
+    // 無効中はゲート/pin/keep-alive/固まり回復/余白修正をすべて止めて素のニコ生に任せる。
+    // following の追跡（scroll リスナー）だけは続け、再有効化した時に実際の位置と食い違わないようにする。
+    const isEnabled = () => document.documentElement.dataset.crEnabled !== '0'
+
     const isCommentContainer = (el) =>
-        el && el.nodeType === 1 && typeof el.matches === 'function' && el.matches('[class*="_body_"]')
+        el && el.nodeType === 1 && typeof el.matches === 'function' && el.matches(BODY_SEL)
 
     const distFromBottom = (el) => el.scrollHeight - el.scrollTop - el.clientHeight
 
@@ -62,14 +73,14 @@
         enumerable: topDesc.enumerable,
         get() { return topDesc.get.call(this) },
         set(v) {
-            if (isCommentContainer(this) && !following && !selfScrolling) return // 引き戻しを無視
+            if (isCommentContainer(this) && !following && !selfScrolling && isEnabled()) return // 引き戻しを無視
             return topDesc.set.call(this, v)
         },
     })
 
     // scrollTo も同様にゲート
     proto.scrollTo = function (...args) {
-        if (isCommentContainer(this) && !following && !selfScrolling) return
+        if (isCommentContainer(this) && !following && !selfScrolling && isEnabled()) return
         return nativeScrollTo.apply(this, args)
     }
 
@@ -137,7 +148,8 @@
     let fpRaf = 0
     function forcePinLoop() {
         fpRaf = 0
-        const el = document.querySelector('[class*="_body_"]')
+        if (!isEnabled()) return   // 無効化されたら鎖を止める（再有効化時は ensureObserving が掛け直す）
+        const el = findBody()
         if (el) pinToBottom(el)
         blankFixWatch()   // 余白の高速検知: クリック/リマウント直後の rAF 密ウィンドウで即修正（throttle/settle/cooldown で暴発防止）
         if (performance.now() < forcePinUntil) fpRaf = requestAnimationFrame(forcePinLoop)
@@ -175,7 +187,7 @@
         }
         _scrollComp = null
         try {
-            const start = document.querySelector('.table-row') || document.querySelector('[class*="_body_"]')
+            const start = document.querySelector('.table-row') || findBody()
             if (!start) return null
             const fk = Object.keys(start).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'))
             if (!fk) return null
@@ -222,11 +234,11 @@
     // 固まりとみなす（静かな配信での誤検出を避ける）。検出時は決定的な項目を記録し、スクロール運動で
     // 描画を起こして自動回復する。
     function freezeWatch() {
-        const el = document.querySelector('[class*="_body_"]')
+        const el = findBody()
         if (!el) return
         if (document.hidden) return                          // 非表示タブでは固まり監視も回復も不要（毎200msのDOM走査を省く）
         const now = performance.now()
-        if (!following) { fzSig = ''; return }               // 上スクロール閲覧中は固まり判定しない＝無駄走査を省く（追従再開時に再ウォームアップ）
+        if (!following || !isEnabled()) { fzSig = ''; return } // 上スクロール閲覧中/無効中は固まり判定しない＝無駄走査を省く（再開時に再ウォームアップ）
         const sig = renderSignature(el)
         if (sig !== fzSig) {
             // 検出後に描画が再開した＝「いつ解消したか」を記録（一過性の無風か、本物の固まりかの区別）。
@@ -306,8 +318,8 @@
     // 追従中は常に「真の底」へ。文字拡大で niconico のスクロールが底まで届かず
     // 最新コメントが見切れる問題を、ここで吸収する。
     function pinIfFollowing() {
-        if (!following) return
-        const el = document.querySelector('[class*="_body_"]')
+        if (!following || !isEnabled()) return
+        const el = findBody()
         if (el && distFromBottom(el) > 0) pinToBottom(el)
     }
 
@@ -352,11 +364,11 @@
 
     // 余白が「rowHeightPx 過大による定常 under-fill」の時だけ、エモーション・トグルでリマウントさせる。
     function blankFixWatch() {
-        if (window.__crNoReviveBlank) { reviveBlankSince = 0; return }  // 既定ON。__crNoReviveBlank=true で無効化
+        if (window.__crNoReviveBlank || !isEnabled()) { reviveBlankSince = 0; return }  // 既定ON。__crNoReviveBlank=true／機能OFFで無効
         if (emoBusy) return
         if (document.hidden) { reviveBlankSince = 0; return }           // 非表示タブでは不要（rAF停止中＝後始末漏れも防ぐ）
         if (reviveFailStreak >= REVIVE_MAX_FAILS) { reviveBlankSince = 0; return }  // 効かない配信で無限リマウントしない（新規マウントで再アーム）
-        const el = observedEl || document.querySelector('[class*="_body_"]')
+        const el = observedEl || findBody()
         if (!el) { reviveBlankSince = 0; return }
         const now = performance.now()
         if (!following) { reviveBlankSince = 0; return }
@@ -422,7 +434,7 @@
                 clearTimeout(watchdog); cleanup()   // style 除去＋emoBusy 解放
                 // リマウント後の rowHeightPx 再計測結果と余白を記録（before/after で検証）。
                 invalidateScrollComp()
-                const el2 = document.querySelector('[class*="_body_"]')
+                const el2 = findBody()
                 const comp2 = getScrollComponent()
                 const calc2 = comp2 && comp2.scrollProcessor && comp2.scrollProcessor.calculator
                 const m2 = el2 ? measureBlank(el2) : null
@@ -440,7 +452,7 @@
                 // REVIVE_MAX_FAILS に達したら blankFixWatch が停止（無限リマウント防止）。効いたらリセット。
                 setTimeout(() => {
                     invalidateScrollComp()
-                    const el3 = document.querySelector('[class*="_body_"]')
+                    const el3 = findBody()
                     const c3 = getScrollComponent()
                     const calc3 = c3 && c3.scrollProcessor && c3.scrollProcessor.calculator
                     const rh3 = calc3 ? calc3._rowHeightPx : null
@@ -467,8 +479,18 @@
     if (typeof ResizeObserver === 'function') ro = new ResizeObserver(schedulePin)
 
     // コメント欄が現れる／差し替わるたびに監視対象を張り替える
+    let wasEnabled = true
     function ensureObserving() {
-        const el = document.querySelector('[class*="_body_"]')
+        const enabled = isEnabled()
+        if (enabled && !wasEnabled && following) {
+            // 再有効化: 拡張CSS（文字拡大）の再適用で高さが変わるが、コメント欄のサイズも子要素も変わらず
+            // MO/RO が鳴らない。追従中なら次の新着を待たず底へ収束させる。強制追従中は上スクロールが
+            // 引き戻されるので、CSS 1回分の再レイアウトが収まる短い窓にとどめる（以後は通常の pin が追う）。
+            forcePinUntil = Math.max(forcePinUntil, performance.now() + 400)
+            startForcePin()
+        }
+        wasEnabled = enabled
+        const el = findBody()
         if (el && el !== observedEl) {
             try { mo.disconnect() } catch (_) {}
             try { if (ro) ro.disconnect() } catch (_) {}
@@ -507,9 +529,10 @@
         if (now - kaThrottleAt < 30) return                 // ~33Hz 上限（過剰駆動を防ぐ）
         kaThrottleAt = now
         if (window.__crNoKeepAlive) return                  // A/B検証用トグル: keep-alive を無効化
+        if (!isEnabled()) return                            // 機能OFF中は素のニコ生に任せる
         if (!following) return                              // 追従中だけ
         if (now - lastUserInputAt < USER_INPUT_MS) return   // ユーザー操作中はそっとしておく
-        const el = observedEl || document.querySelector('[class*="_body_"]')
+        const el = observedEl || findBody()
         if (!el) return
         if (distFromBottom(el) > NEAR_BOTTOM_PX + 6) return // 最下部の時だけ
         const comp = getScrollComponent()

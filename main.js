@@ -46,6 +46,7 @@ document.addEventListener('DOMContentLoaded', () => {
         commentTextFontSize = clampPct(result.commentTextFontSize)
         isShowFullComment = result.isShowFullComment || defaultIsShowFullComment
         isExtensionEnabled = (typeof result.isExtensionEnabled === 'boolean') ? result.isExtensionEnabled : defaultIsExtensionEnabled
+        syncEnabledFlagToPage()
 
         // コメントの挿入を監視してから初期化を開始
         startCommentMonitoring(targetNode)
@@ -155,12 +156,21 @@ function enableExtensionTemporarily() {
 }
 
 /**
+ * 有効/無効を inject.js(メインワールド)へ伝える。メインワールドは chrome.storage を読めないため、
+ * 両ワールドで共有している DOM の属性 <html data-cr-enabled> で受け渡す。
+ */
+function syncEnabledFlagToPage() {
+    try { document.documentElement.dataset.crEnabled = isExtensionEnabled ? '1' : '0' } catch (_) {}
+}
+
+/**
  * 機能拡張を無効化（ユーザー設定を変更）
  */
 function disableExtension() {
     if (!isExtensionEnabled) return
-    
+
     isExtensionEnabled = false
+    syncEnabledFlagToPage()
     disableExtensionTemporarily()
     
     // 設定を保存
@@ -177,7 +187,8 @@ function enableExtension() {
     if (isExtensionEnabled) return
     
     isExtensionEnabled = true
-    
+    syncEnabledFlagToPage()
+
     // contents-tab-panelが存在する場合のみ実際に機能を有効化
     if (isTabPanelAvailable) {
         enableExtensionTemporarily()
@@ -194,9 +205,12 @@ function enableExtension() {
  * 設定パネルの状態を更新
  */
 function updateSettingPanelState() {
-    const toggleSwitch = document.querySelector('.toggle-switch')
-    const toggleSlider = document.querySelector('.toggle-slider')
-    const settingCard = document.querySelector('.setting-container > div > div:nth-child(2)')
+    // 自前のパネル内に限定して探す（汎用的なクラス名がページ側の要素に当たらないように）
+    const panel = document.querySelector('.setting-container')
+    if (!panel) return
+    const toggleSwitch = panel.querySelector('.toggle-switch')
+    const toggleSlider = panel.querySelector('.toggle-slider')
+    const settingCard = panel.querySelector('.setting-card')
     
     if (toggleSwitch && toggleSlider) {
         // トグルスイッチの状態を更新
@@ -475,7 +489,7 @@ function insertSettingPanel(targetNode) {
             </div>
 
             <!-- 設定項目カード -->
-            <div style="
+            <div class="setting-card" style="
                 opacity: ${isExtensionEnabled ? '1' : '0.4'};
                 pointer-events: ${isExtensionEnabled ? 'auto' : 'none'};
                 transition: all 0.3s ease;
@@ -1049,13 +1063,6 @@ function watchFullscreenChange() {
 // ページアンロード時のクリーンアップ
 window.addEventListener('beforeunload', () => {
     cleanupResources()
-})
-
-// ページ非表示時のクリーンアップ（オプション）
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        // ページが非表示になった時の処理（必要に応じて）
-    }
 })
 
 /**

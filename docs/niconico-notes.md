@@ -252,12 +252,12 @@
     `rowHeightPx` 書き換え（revert）なしには消せない。残る36pxのために React/keep-alive と毎フレーム競合する新コード路を足す価値は無い。
     → **1.2.21 診断を撤去し 1.2.20 を据え置き**（推測修正を避ける＝ここでは「直さない」が正解）。
 
-### 2026-06-08 追記：エモーション・トグル復活を実機CDPで再評価＋opt-in 実装
+### 2026-06-08 追記：エモーション・トグル復活を実機CDPで再評価＋実装（1.2.22 で既定ON）
 上の「受容」は**ページ側の幾何トリック**に対する結論。ユーザー実体験「『最新に戻る』後にエモーションボタン2回押しで余白が消えた」を受け、別レバー（**ニコ生自身に再計測させる**）を実機 CDP（`e2e/`, Edge を起動して live /watch/ に接続）で検証した:
 - ✅ **エモーション・トグル＝本物のリマウント**: `_body_`/`calculator`/`sentinelElement` の identity が全て入れ替わり、トグル中は `_body_` が一瞬 DOM から消える（破棄→再生成）。**`forcePin` が先頭飛びをフレーム0から吸収**（`distFromBottom=0`・`follow=1` 維持を実測）＝1.2.6 の撤去理由は今の基盤では解消。
 - ✅ **点滅ゼロの「その場再計測」は不在**: `calculator` のメンバは `_rowHeightPx/_bufferSize/_rowsLength/_scrollTopPx/_offsetHeightPx/_fixedBottom/updateScrollTopPx/scrollToBottom/calculateScrollTopForRow`、bool は `_fixedBottom` のみ。**measure/initialized 系は無い**＝rowHeightPx はコンポーネントが**マウント時に1回測る**。**再計測にはリマウントが要る＝エモーション・トグルが唯一のレバー**（候補 C1 は消滅）。
 - ⚠️→✅ **当初このビルドで余白を作れなかった**（niconico は `rowHeightPx=32` を測り、フォント 50%→300% でも 32 のまま＝over-fill で余白なし＝元の「常に32」所見と一致）が、**後にリロードや「上スクロール＋最新復帰」の繰り返しで自然に再現**。niconico が**マウント時に背の高い行を測ると `rowHeightPx` が膨張**（実測で 62/65/74/99/165）→ frame 過小で余白。`rowHeightPx` 過大は**実セッション固有＝どの行をマウント時に測るか**で出る（固まり同様）。
-- ✅ **実装＝既定ON `inject.js` `blankFixWatch`/`emotionRemount`（実機実証済み・1.2.22）**: 「最下部・操作なし・`rowHeightPx>36`（軽量プレ判定で既定フォントの常時 rect 計測を省く）・`rowHeightPx>実行平均×1.15`・余白>60px が ~600ms 定常」の時だけ、**リマウントボタンを2回トグルして1回リマウント**（クールダウン5s）→ niconico がマウント時に rowHeightPx を素の32へ測り直し→frame 増→余白解消。先頭飛びは forcePin 吸収、開閉アニメは一時 `transition:none` 抑制（実機でチラつき体感なし）、入力中スキップ。**リマウントボタン**: `[aria-label="エモーションパネルの開閉"]` → 無ければ `[aria-label="ギフト"]`（放送設定でエモーションOFF時の代替。実機でギフトのトグルもリマウント確認）。両方無ければ no-op（無害）。**無効化** `window.__crNoReviveBlank=true`。記録 `window.__crBlankFix={rowHeightBefore/After,blankBefore/After,rowHeightAt1500/blankAt1500,method:'emotion'|'gift'}`・`window.__crStats.blankFix`。**実機検証(2026-06-08)**: 自然余白で `rowHeightBefore65→After32 / blank176→0 / +1.5s維持 / 発火1回`、自動発火で余白解消をユーザー確認＝採用（上の「受容」結論は本機能で上書き）。
+- ✅ **実装＝既定ON `inject.js` `blankFixWatch`/`emotionRemount`（実機実証済み・1.2.22）**: 「最下部・操作なし・`rowHeightPx>36`（軽量プレ判定で既定フォントの常時 rect 計測を省く）・`rowHeightPx>実行平均×1.15`・余白>60px が ~600ms 定常」の時だけ、**リマウントボタンを2回トグルして1回リマウント**（クールダウン3s＝`REVIVE_COOLDOWN_MS`）→ niconico がマウント時に rowHeightPx を素の32へ測り直し→frame 増→余白解消。先頭飛びは forcePin 吸収、開閉アニメは一時 `transition:none` 抑制（実機でチラつき体感なし）、入力中スキップ。**リマウントボタン**: `[aria-label="エモーションパネルの開閉"]` → 無ければ `[aria-label="ギフト"]`（放送設定でエモーションOFF時の代替。実機でギフトのトグルもリマウント確認）。両方無ければ no-op（無害）。**無効化** `window.__crNoReviveBlank=true`。記録 `window.__crBlankFix={rowHeightBefore/After,blankBefore/After,rowHeightAt1500/blankAt1500,method:'emotion'|'gift'}`・`window.__crStats.blankFix`。**実機検証(2026-06-08)**: 自然余白で `rowHeightBefore65→After32 / blank176→0 / +1.5s維持 / 発火1回`、自動発火で余白解消をユーザー確認＝採用（上の「受容」結論は本機能で上書き）。
 - 🛡 **出荷前レビューで追加した安全策**: ①**効果判定バックオフ**＝発火+1.5sで `rowHeightPx>36`（=効かなかった）or ボタン不在なら失敗カウント、`REVIVE_MAX_FAILS=2` で停止（効かない配信での無限リマウント防止）。ニコ生由来の新規マウント（SPA遷移/エモーション復帰＝自分のリマウント以外）で `reviveFailStreak` をリセット＝再アーム。②**非表示タブで停止**（`document.hidden`）。③**rAF飢餓ウォッチドッグ**＝背景化で rAF が止まっても2s後に `emoBusy`/`transition:none` を確実に解放。④**フォーカスは閉じクリック直後に復元**。⑤パネル開き中は `_body_` が消えるので blankFixWatch は `!el` で発火不可＝開いたパネルを誤トグルしない。
 - ⏱ **レイテンシ短縮**: forcePin 抑止を撤去＋`REVIVE_SETTLE_MS 600→100`＋`forcePinLoop` の毎フレームから高速検知（rect は50ms throttle）＝余白出現から **約2s→約0.3s** で回復。
 
@@ -280,6 +280,12 @@
   フルスクリーン制御、コメント番号順の並べ替え（`sortCommentRows`）。
 - 隔離ワールドとメインワールドは `Element.prototype` が別オブジェクト。隔離側からの `scrollTo` は
   メイン側の番人ラッパーに掛からない（= 拡張自身のスクロールはブロックされない）。この分離を活用。
+- **設定パネルの有効/無効は `<html data-cr-enabled="0|1">` で inject.js へ伝える**（メインワールドは
+  `chrome.storage` を読めない。DOM は両ワールド共有）。`main.js` が設定読み込み時とトグル時に書き、
+  inject.js は `'0'` の間ゲート/pin/keep-alive/freezeWatch/blankFix をすべて止める（未設定＝有効扱い）。
+  `following` の追跡だけは続け、再有効化時は追従中なら `forcePinLoop` で底へ収束させる（強制追従中は
+  上スクロールが引き戻されるので、窓は 400ms と短め）。
+  ※1.2.22 以前はこの受け渡しが無く、OFF にしても inject.js は動き続けていた。検証: `e2e/verify_toggle.mjs`。
 
 ## 開発・検証時の注意（ハマりどころ）
 
@@ -290,6 +296,10 @@
 - Playwright の合成ホイール（`page.mouse.wheel`）はこのページで発火しないことがある。実機のホイール
   操作が必要。テストで上スクロールを再現するには、別 realm（一時 iframe）の未改変な `scrollTop`
   セッターを呼んでネイティブ相当のスクロールにする（メイン側の番人ゲートを迂回できる）。
+- `launch.mjs` で起動した Edge は描画が ~30fps に絞られ、**ときどき ~1s フレームが止まる**。scroll イベントは
+  フレームで配送されるため、合成 wheel から `USER_INPUT_MS`(300ms) 以上遅れて届き「ユーザー操作でない」と
+  判定されうる（実機のホイールは同一フレームなので起きない）。テストで上スクロールを再現する時は、
+  inject.js が scroll イベントを受け取るまで wheel を送り続ける（`verify_toggle.mjs` の `userScrollUp`）。
 - コメント欄は仮想スクロール。`.table-row` の数は十数個だが `scrollHeight` は全コメント分。
   合成した行を注入しても検証にならないので、実際に流れるコメントで確認する。
 - 検証用の Playwright ハーネスは `commentresize/e2e/`（リポジトリ外）。CDP `:9222` で接続。
