@@ -372,6 +372,29 @@
         if (max > 2) calc.scrollTopPx = max - 1.01   // scrollTopIsBottom は「>= max−1」
     }
 
+    // ===== 追従を外している間は、ニコ生の「底にいる」判定（isAtBottomByIO）も外す（底の少し上で読んでいる時のズレ対策）=====
+    // pc-watch は scroll のたびに、!isFixedBottomAvailable（= !(isAtBottomByIO && fixedBottom)）かつ 200件に達していれば
+    // リストを固定（shouldUpdateNewComments=false）して「最新コメントに戻る」を出す＝上スクロール中は行が流れない。
+    // ところが isAtBottomByIO の元になる底センチネルは仮想の底（rowsLength*rowHeightPx）に置かれ、拡張で行が高いと
+    // 実際の底の少し上でもセンチネルが画面内に残る → 「底にいる」扱いでリストが流れ続け、読んでいる行の前後で行が
+    // 足し引きされる。スクロールアンカリングが補正しきれないと読んでいる行が跳ぶ（実機で1フレームに115px）。
+    // 追従OFF（＝ユーザーが上スクロールした）の間は false を返し、ニコ生本来の「上スクロールで固定」に揃える。
+    // 追従中はニコ生の値をそのまま返す。isAtBottomByIO はクラスフィールド（インスタンスごとの値）なのでインスタンスに掛ける。
+    const bottomFlagPatched = new WeakSet()
+    function patchBottomFlag(sp) {
+        if (!sp || bottomFlagPatched.has(sp)) return
+        bottomFlagPatched.add(sp)
+        let real = sp.isAtBottomByIO
+        try {
+            Object.defineProperty(sp, 'isAtBottomByIO', {
+                configurable: true,
+                enumerable: true,
+                get() { return (following || !isEnabled()) ? real : false },
+                set(v) { real = v },
+            })
+        } catch (_) {}
+    }
+
     // ===== 下余白の修正（エモーション・トグルでリマウント→niconico に rowHeightPx を再計測させる）=====
     // 実機調査(2026-06, e2e の CDP プローブ)で機構を確認:
     //  - エモーションパネルの開閉はコメント欄を破棄→再生成（リマウント）する（_body_/calculator/sentinel の
@@ -560,6 +583,8 @@
             startForcePin()
             schedulePin()
         }
+        const comp = getScrollComponent()   // 2秒キャッシュ付き
+        if (comp) patchBottomFlag(comp.scrollProcessor)   // コメント欄が作り直されたら新しいインスタンスにも掛ける
         detachInternalBottom()   // 追従OFF中に内部が最下部へ戻っていたら外す（上余白の暴走防止の保険）
         // 固まり検出＋穏やかな自己回復（描画が止まった時だけ作動。無害）。
         freezeWatch()
